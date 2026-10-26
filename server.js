@@ -11,7 +11,6 @@ const db = createClient({
     authToken: TURSO_TOKEN
 });
 
-// Ensure Turso database schema
 async function initDB() {
     try {
         await db.execute(`CREATE TABLE IF NOT EXISTS tokens (
@@ -20,11 +19,11 @@ async function initDB() {
             created_at INTEGER,
             activated_at INTEGER,
             expires_at INTEGER,
-            device_id TEXT,
+            device_id TEXT NOT NULL,
             note TEXT,
             status TEXT
         )`);
-        console.log('[Turso] Database initialized and schema verified');
+        console.log('[Turso] Database schema verified with pre-set device_id requirement');
     } catch (e) {
         console.error('[Turso] Initialization error:', e.message);
     }
@@ -81,17 +80,17 @@ const server = http.createServer(async (req, res) => {
         return sendJson(200, { status: 'ok', time: Date.now(), database: 'turso-libsql' });
     }
 
-    // API: Verify token for device
+    // API: Verify token for device at startup
     // Request: { "token": "XXXXXXXX", "device_id": "..." }
     if (pathname === '/api/verify' && req.method === 'POST') {
         try {
             const body = await readJsonBody();
-            if (!body.token || !body.device_id) {
+            const tokenStr = String(body.token || '').trim().toUpperCase();
+            const deviceId = String(body.device_id || '').trim().toLowerCase();
+
+            if (!tokenStr || !deviceId) {
                 return sendJson(400, { unlocked: false, message: 'Missing token or device_id' });
             }
-
-            const tokenStr = String(body.token).trim().toUpperCase();
-            const deviceId = String(body.device_id).trim();
 
             const result = await db.execute({
                 sql: 'SELECT * FROM tokens WHERE token = ?',
@@ -99,17 +98,23 @@ const server = http.createServer(async (req, res) => {
             });
 
             if (result.rows.length === 0) {
-                return sendJson(404, { unlocked: false, reason: 'not_found', message: 'Token not found' });
+                return sendJson(404, { unlocked: false, reason: 'not_found', message: 'Invalid token. Token not found.' });
             }
 
             const found = result.rows[0];
+            const preSetDevice = String(found.device_id || '').trim().toLowerCase();
+
+            // Strict Device ID check
+            if (preSetDevice !== deviceId) {
+                return sendJson(403, {
+                    unlocked: false,
+                    reason: 'device_mismatch',
+                    message: `Device mismatch! This token was generated for device ${preSetDevice}`
+                });
+            }
 
             if (found.status === 'revoked') {
                 return sendJson(403, { unlocked: false, reason: 'revoked', message: 'Token has been revoked by admin' });
-            }
-
-            if (found.device_id && found.device_id !== deviceId) {
-                return sendJson(403, { unlocked: false, reason: 'device_mismatch', message: 'Token is bound to another device' });
             }
 
             const now = Date.now();
@@ -126,7 +131,7 @@ const server = http.createServer(async (req, res) => {
                 });
             }
 
-            const daysLeft = found.expires_at ? Math.max(0, Math.ceil((Number(found.expires_at) - now) / (1000 * 60 * 60 * 24))) : 0;
+            const daysLeft = found.expires_at ? Math.max(0, Math.ceil((Number(found.expires_at) - now) / (1000 * 60 * 60 * 24))) : Number(found.period_days);
             return sendJson(200, {
                 unlocked: true,
                 token: found.token,
@@ -145,12 +150,12 @@ const server = http.createServer(async (req, res) => {
     if (pathname === '/api/activate' && req.method === 'POST') {
         try {
             const body = await readJsonBody();
-            if (!body.token || !body.device_id) {
+            const tokenStr = String(body.token || '').trim().toUpperCase();
+            const deviceId = String(body.device_id || '').trim().toLowerCase();
+
+            if (!tokenStr || !deviceId) {
                 return sendJson(400, { success: false, unlocked: false, message: 'Missing token or device_id' });
             }
-
-            const tokenStr = String(body.token).trim().toUpperCase();
-            const deviceId = String(body.device_id).trim();
 
             const result = await db.execute({
                 sql: 'SELECT * FROM tokens WHERE token = ?',
@@ -158,27 +163,34 @@ const server = http.createServer(async (req, res) => {
             });
 
             if (result.rows.length === 0) {
-                return sendJson(404, { success: false, unlocked: false, message: 'Invalid 8-character token' });
+                return sendJson(404, { success: false, unlocked: false, message: 'Invalid 8-character token. Token does not exist.' });
             }
 
             const found = result.rows[0];
+            const preSetDevice = String(found.device_id || '').trim().toLowerCase();
 
-            if (found.status === 'revoked') {
-                return sendJson(403, { success: false, unlocked: false, message: 'Token has been revoked' });
+            // STRICT DEVICE ID MATCH: The token MUST belong to this pre-set device ID!
+            if (preSetDevice !== deviceId) {
+                return sendJson(403, {
+                    success: false,
+                    unlocked: false,
+                    message: `Wrong device! This token was issued for device ID: ${preSetDevice}`
+                });
             }
 
-            if (found.device_id && found.device_id !== deviceId) {
-                return sendJson(403, { success: false, unlocked: false, message: 'Token is already used on another device' });
+            if (found.status === 'revoked') {
+                return sendJson(403, { success: false, unlocked: false, message: 'This token has been revoked by admin' });
             }
 
             const now = Date.now();
             let expiresAt = found.expires_at;
 
-            if (!found.device_id) {
+            // First activation: compute expiration from now + period_days
+            if (!found.activated_at) {
                 expiresAt = now + (Number(found.period_days) * 24 * 60 * 60 * 1000);
                 await db.execute({
-                    sql: 'UPDATE tokens SET device_id = ?, activated_at = ?, expires_at = ?, status = ? WHERE token = ?',
-                    args: [deviceId, now, expiresAt, 'active', tokenStr]
+                    sql: 'UPDATE tokens SET activated_at = ?, expires_at = ?, status = ? WHERE token = ?',
+                    args: [now, expiresAt, 'active', tokenStr]
                 });
             } else if (now > found.expires_at) {
                 await db.execute({
@@ -196,7 +208,7 @@ const server = http.createServer(async (req, res) => {
                 expires_at: expiresAt,
                 days_left: daysLeft,
                 period_days: found.period_days,
-                message: 'App successfully unlocked!'
+                message: 'Device verified and unlocked!'
             });
         } catch (err) {
             return sendJson(500, { success: false, unlocked: false, message: 'Server error: ' + err.message });
@@ -230,12 +242,20 @@ const server = http.createServer(async (req, res) => {
         }
     }
 
-    // API: Generate new token (Admin)
+    // API: Generate new token with PRE-SET Device ID (Admin)
     if (pathname === '/api/tokens/generate' && req.method === 'POST') {
         try {
             const body = await readJsonBody();
+            const deviceId = String(body.device_id || '').trim().toLowerCase();
             const periodDays = parseInt(body.period_days, 10) || 30;
             const note = body.note ? String(body.note).trim() : '';
+
+            if (!deviceId) {
+                return sendJson(400, {
+                    success: false,
+                    message: 'Target Device ID is required. Every token must be pre-set for a device.'
+                });
+            }
 
             let token = generate8CharToken();
             let check = await db.execute({ sql: 'SELECT token FROM tokens WHERE token = ?', args: [token] });
@@ -247,8 +267,8 @@ const server = http.createServer(async (req, res) => {
             const now = Date.now();
             await db.execute({
                 sql: `INSERT INTO tokens (token, period_days, created_at, activated_at, expires_at, device_id, note, status)
-                      VALUES (?, ?, ?, NULL, NULL, NULL, ?, ?)`,
-                args: [token, periodDays, now, note, 'available']
+                      VALUES (?, ?, ?, NULL, NULL, ?, ?, ?)`,
+                args: [token, periodDays, now, deviceId, note, 'available']
             });
 
             return sendJson(201, {
@@ -259,7 +279,7 @@ const server = http.createServer(async (req, res) => {
                     createdAt: now,
                     activatedAt: null,
                     expiresAt: null,
-                    deviceId: null,
+                    deviceId: deviceId,
                     note: note,
                     status: 'available'
                 }
@@ -315,7 +335,7 @@ function getDashboardHtml() {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Saned Assistant - Turso Cloud Dashboard</title>
+<title>Saned Assistant - License Admin Dashboard</title>
 <style>
   :root {
     --bg: #0f172a;
@@ -331,19 +351,19 @@ function getDashboardHtml() {
   }
   * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
   body { background: var(--bg); color: var(--text); padding: 2rem 1rem; }
-  .container { max-width: 1000px; margin: 0 auto; }
+  .container { max-width: 1040px; margin: 0 auto; }
   header { margin-bottom: 2rem; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 1rem; }
   h1 { font-size: 1.8rem; font-weight: 700; color: #fff; display: flex; align-items: center; gap: 0.5rem; }
   .badge-app { font-size: 0.75rem; background: var(--accent); color: white; padding: 0.2rem 0.6rem; border-radius: 9999px; }
   .badge-turso { font-size: 0.75rem; background: #059669; color: white; padding: 0.2rem 0.6rem; border-radius: 9999px; }
   .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 1.5rem; margin-bottom: 2rem; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.3); }
-  .card-title { font-size: 1.2rem; font-weight: 600; margin-bottom: 1rem; color: #e2e8f0; }
+  .card-title { font-size: 1.2rem; font-weight: 600; margin-bottom: 1rem; color: #e2e8f0; display: flex; align-items: center; gap: 0.5rem; }
   .form-row { display: flex; gap: 1rem; flex-wrap: wrap; align-items: flex-end; }
-  .form-group { display: flex; flex-direction: column; gap: 0.4rem; flex: 1; min-width: 180px; }
-  label { font-size: 0.85rem; color: var(--text-muted); font-weight: 500; }
+  .form-group { display: flex; flex-direction: column; gap: 0.4rem; flex: 1; min-width: 200px; }
+  label { font-size: 0.85rem; color: var(--text-muted); font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; }
   select, input { background: #0f172a; border: 1px solid var(--border); color: #fff; padding: 0.65rem 0.9rem; border-radius: 8px; font-size: 0.95rem; outline: none; }
   select:focus, input:focus { border-color: var(--accent); }
-  button { background: var(--accent); color: white; border: none; padding: 0.65rem 1.4rem; border-radius: 8px; font-weight: 600; cursor: pointer; transition: background 0.2s; font-size: 0.95rem; }
+  button { background: var(--accent); color: white; border: none; padding: 0.65rem 1.4rem; border-radius: 8px; font-weight: 600; cursor: pointer; transition: background 0.2s; font-size: 0.95rem; white-space: nowrap; }
   button:hover { background: var(--accent-hover); }
   .btn-danger { background: #b91c1c; }
   .btn-danger:hover { background: var(--danger); }
@@ -351,7 +371,8 @@ function getDashboardHtml() {
   .token-table { width: 100%; border-collapse: collapse; margin-top: 1rem; }
   .token-table th, .token-table td { padding: 0.85rem 1rem; text-align: left; border-bottom: 1px solid var(--border); font-size: 0.9rem; }
   .token-table th { color: var(--text-muted); font-weight: 600; background: #162032; font-size: 0.8rem; text-transform: uppercase; }
-  .token-box { font-family: monospace; font-size: 1.1rem; font-weight: 700; color: #38bdf8; letter-spacing: 0.1em; background: #0f172a; padding: 0.2rem 0.5rem; border-radius: 4px; display: inline-block; }
+  .token-box { font-family: monospace; font-size: 1.15rem; font-weight: 700; color: #38bdf8; letter-spacing: 0.1em; background: #0f172a; padding: 0.2rem 0.5rem; border-radius: 4px; display: inline-block; }
+  .device-box { font-family: monospace; font-size: 0.95rem; color: #a5f3fc; background: #0f172a; padding: 0.2rem 0.5rem; border-radius: 4px; display: inline-block; }
   .status-tag { padding: 0.2rem 0.6rem; border-radius: 9999px; font-size: 0.75rem; font-weight: 600; text-transform: uppercase; display: inline-block; }
   .status-available { background: rgba(59, 130, 246, 0.2); color: #60a5fa; border: 1px solid #3b82f6; }
   .status-active { background: rgba(16, 185, 129, 0.2); color: #34d399; border: 1px solid #10b981; }
@@ -368,15 +389,15 @@ function getDashboardHtml() {
 <div class="container">
   <header>
     <div>
-      <h1>Saned Assistant <span class="badge-app">Verification</span> <span class="badge-turso">Turso Cloud DB</span></h1>
-      <p style="color: var(--text-muted); font-size: 0.9rem; margin-top: 0.2rem;">Permanent Cloud License Manager & Token Generator</p>
+      <h1>Saned Assistant <span class="badge-app">License Manager</span> <span class="badge-turso">Turso Cloud</span></h1>
+      <p style="color: var(--text-muted); font-size: 0.9rem; margin-top: 0.2rem;">Pre-Set Device Verification & Subscription Control</p>
     </div>
-    <div style="color: #34d399; font-size: 0.85rem;" id="server-status">● Cloud SQLite Connected</div>
+    <div style="color: #34d399; font-size: 0.85rem;">● Turso Cloud DB Active</div>
   </header>
 
   <div class="stats-grid">
     <div class="stat-card">
-      <div style="color: var(--text-muted); font-size: 0.85rem;">Total Generated</div>
+      <div style="color: var(--text-muted); font-size: 0.85rem;">Total Licenses</div>
       <div class="stat-value" id="stat-total" style="color: #60a5fa;">0</div>
     </div>
     <div class="stat-card">
@@ -390,10 +411,14 @@ function getDashboardHtml() {
   </div>
 
   <div class="card">
-    <div class="card-title">⚡ Generate 8-Character Token</div>
+    <div class="card-title">🔑 Generate Token for Pre-Set Device</div>
     <form id="gen-form" onsubmit="generateToken(event)">
       <div class="form-row">
-        <div class="form-group">
+        <div class="form-group" style="flex: 1.4;">
+          <label>Target Device ID (Required) *</label>
+          <input type="text" id="device-id-input" placeholder="e.g. cf4ade3f1edec2c7" required style="font-family: monospace;">
+        </div>
+        <div class="form-group" style="flex: 1;">
           <label>Subscription Period</label>
           <select id="period-select">
             <option value="1">1 Day</option>
@@ -405,34 +430,34 @@ function getDashboardHtml() {
             <option value="365">365 Days (1 Year)</option>
           </select>
         </div>
-        <div class="form-group">
+        <div class="form-group" style="flex: 1;">
           <label>Customer Name / Note (Optional)</label>
           <input type="text" id="note-input" placeholder="e.g. Driver Ahmed">
         </div>
         <div>
-          <button type="submit">+ Generate Token</button>
+          <button type="submit">+ Issue Token</button>
         </div>
       </div>
     </form>
   </div>
 
   <div class="card">
-    <div class="card-title">🔑 Tokens & Device Bindings (Persisted in Turso)</div>
+    <div class="card-title">📋 Issued Licenses & Pre-Set Devices</div>
     <div style="overflow-x: auto;">
       <table class="token-table">
         <thead>
           <tr>
             <th>Token</th>
+            <th>Pre-Set Device ID</th>
             <th>Duration</th>
             <th>Status</th>
-            <th>Bound Device ID</th>
             <th>Expires On</th>
-            <th>Customer / Note</th>
+            <th>Customer Note</th>
             <th>Actions</th>
           </tr>
         </thead>
         <tbody id="tokens-body">
-          <tr><td colspan="7" style="text-align: center; color: var(--text-muted);">Loading tokens from Turso...</td></tr>
+          <tr><td colspan="7" style="text-align: center; color: var(--text-muted);">Loading tokens...</td></tr>
         </tbody>
       </table>
     </div>
@@ -457,25 +482,25 @@ function renderTokens(tokens) {
   document.getElementById('stat-available').innerText = tokens.filter(t => t.status === 'available').length;
 
   if (tokens.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="7" style="text-align: center; color: var(--text-muted); padding: 2rem;">No tokens in Turso database yet. Click "Generate Token" above.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="7" style="text-align: center; color: var(--text-muted); padding: 2rem;">No tokens issued yet. Enter a Device ID and click "+ Issue Token" above.</td></tr>';
     return;
   }
 
   tbody.innerHTML = tokens.map(t => {
-    let expiresStr = '-';
+    let expiresStr = 'Not yet activated';
     if (t.expiresAt) {
       const expDate = new Date(t.expiresAt);
       const daysLeft = Math.max(0, Math.ceil((t.expiresAt - Date.now()) / (1000 * 60 * 60 * 24)));
       expiresStr = expDate.toLocaleDateString() + ' (' + daysLeft + 'd left)';
     }
 
-    const deviceStr = t.deviceId ? '<span style="font-family: monospace; color: #a5f3fc;">' + t.deviceId + '</span>' : '<span style="color: var(--text-muted);">Not activated</span>';
+    const deviceStr = '<span class="device-box">' + t.deviceId + '</span>';
 
     return '<tr>' +
       '<td><span class="token-box">' + t.token + '</span><button class="copy-btn" onclick="copyToken(\\'' + t.token + '\\')">Copy</button></td>' +
+      '<td>' + deviceStr + '</td>' +
       '<td>' + t.periodDays + ' Days</td>' +
       '<td><span class="status-tag status-' + t.status + '">' + t.status + '</span></td>' +
-      '<td>' + deviceStr + '</td>' +
       '<td>' + expiresStr + '</td>' +
       '<td style="color: var(--text-muted);">' + (t.note || '-') + '</td>' +
       '<td>' +
@@ -488,18 +513,29 @@ function renderTokens(tokens) {
 
 async function generateToken(e) {
   e.preventDefault();
+  const deviceId = document.getElementById('device-id-input').value.trim();
   const periodDays = document.getElementById('period-select').value;
-  const note = document.getElementById('note-input').value;
+  const note = document.getElementById('note-input').value.trim();
+
+  if (!deviceId) {
+    alert('Please enter the target Device ID');
+    return;
+  }
+
   try {
     const res = await fetch('/api/tokens/generate', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ period_days: periodDays, note: note })
+      body: JSON.stringify({ device_id: deviceId, period_days: periodDays, note: note })
     });
     const data = await res.json();
     if (data.success) {
+      document.getElementById('device-id-input').value = '';
       document.getElementById('note-input').value = '';
       fetchTokens();
+      alert('Token generated successfully: ' + data.token.token + ' for device ' + deviceId);
+    } else {
+      alert('Error: ' + data.message);
     }
   } catch (err) {
     alert('Error generating token: ' + err.message);
@@ -507,7 +543,7 @@ async function generateToken(e) {
 }
 
 async function revokeToken(token) {
-  if (!confirm('Are you sure you want to revoke token ' + token + '? The user will be locked out immediately.')) return;
+  if (!confirm('Revoke token ' + token + '? The device will be locked out immediately.')) return;
   await fetch('/api/tokens/revoke', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
