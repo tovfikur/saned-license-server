@@ -1,0 +1,24 @@
+{
+  "tokens": [
+    {
+      "token": "Z2ARPSTJ",
+      "periodDays": 30,
+      "createdAt": 1793040686461,
+      "activatedAt": 1793040698223,
+      "expiresAt": 1795632698223,
+      "deviceId": "cf4ade3f1edec2c7",
+      "note": "Driver Premium License",
+      "status": "active"
+    },
+    {
+      "token": "M7M6WG4F",
+      "periodDays": 30,
+      "createdAt": 1793040462478,
+      "activatedAt": 1793040546285,
+      "expiresAt": 1795632546285,
+      "deviceId": "cf4ade3f1edec2c7",
+      "note": "Test User Phone",
+      "status": "revoked"
+    }
+  ]
+}
