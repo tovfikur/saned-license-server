@@ -1,32 +1,37 @@
 const http = require('http');
-const fs = require('fs');
-const path = require('path');
 const crypto = require('crypto');
+const { createClient } = require('@libsql/client');
 
 const PORT = process.env.PORT || 8888;
-const DB_FILE = path.join(__dirname, 'database.json');
+const TURSO_URL = process.env.TURSO_DATABASE_URL || "libsql://saned-license-db-tovfikur.aws-ap-northeast-1.turso.io";
+const TURSO_TOKEN = process.env.TURSO_AUTH_TOKEN || "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhIjoicnciLCJpYXQiOjE3OTMwNDEwMzAsImlkIjoiMDFhMTc5OTItYmYwMS03YzViLWExZmYtMTU2NDFkNTgwMjhjIiwia2lkIjoiUUJzcEpWZzYydEZnb1VoTXItUEtMaVVrWWhlSnhOa2FUNkdrR3pSRkNzVSIsInJpZCI6ImExMzk1ODk1LTlkYWItNGRmYS04ZjczLWRhYTk2MDk0NzcyNCJ9.gUcFOe7BIbE7SMXVtG7vUB7pAu9E_PkXwS1ri_S78ot1vBd3U9OZNSqk2Q7cQh9OGLMLuV4XaPmADjzFassBDA";
 
-// Initialize or load DB
-function loadDB() {
+const db = createClient({
+    url: TURSO_URL,
+    authToken: TURSO_TOKEN
+});
+
+// Ensure Turso database schema
+async function initDB() {
     try {
-        if (fs.existsSync(DB_FILE)) {
-            const raw = fs.readFileSync(DB_FILE, 'utf-8');
-            return JSON.parse(raw);
-        }
+        await db.execute(`CREATE TABLE IF NOT EXISTS tokens (
+            token TEXT PRIMARY KEY,
+            period_days INTEGER,
+            created_at INTEGER,
+            activated_at INTEGER,
+            expires_at INTEGER,
+            device_id TEXT,
+            note TEXT,
+            status TEXT
+        )`);
+        console.log('[Turso] Database initialized and schema verified');
     } catch (e) {
-        console.error('Error loading DB, creating new:', e.message);
+        console.error('[Turso] Initialization error:', e.message);
     }
-    const initial = { tokens: [] };
-    saveDB(initial);
-    return initial;
 }
 
-function saveDB(data) {
-    fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2), 'utf-8');
-}
+initDB();
 
-// Generate an 8-character uppercase alphanumeric token
-// Using unambiguous characters (no 0/O, 1/I)
 const CHARS = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
 function generate8CharToken() {
     let token = '';
@@ -37,8 +42,7 @@ function generate8CharToken() {
     return token;
 }
 
-const server = http.createServer((req, res) => {
-    // CORS headers
+const server = http.createServer(async (req, res) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -52,211 +56,247 @@ const server = http.createServer((req, res) => {
     const parsedUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
     const pathname = parsedUrl.pathname;
 
-    // Helper to read JSON body
-    function readJsonBody(callback) {
-        let body = '';
-        req.on('data', chunk => { body += chunk; });
-        req.on('end', () => {
-            try {
-                const data = body ? JSON.parse(body) : {};
-                callback(null, data);
-            } catch (err) {
-                callback(err, null);
-            }
+    function readJsonBody() {
+        return new Promise((resolve, reject) => {
+            let body = '';
+            req.on('data', chunk => { body += chunk; });
+            req.on('end', () => {
+                try {
+                    const data = body ? JSON.parse(body) : {};
+                    resolve(data);
+                } catch (err) {
+                    reject(err);
+                }
+            });
         });
     }
 
-    // Helper to send JSON response
     function sendJson(statusCode, data) {
         res.writeHead(statusCode, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(data));
     }
 
-    // API: Health check
+    // Health check
     if (pathname === '/api/health' && req.method === 'GET') {
-        return sendJson(200, { status: 'ok', time: Date.now() });
+        return sendJson(200, { status: 'ok', time: Date.now(), database: 'turso-libsql' });
     }
 
     // API: Verify token for device
     // Request: { "token": "XXXXXXXX", "device_id": "..." }
     if (pathname === '/api/verify' && req.method === 'POST') {
-        readJsonBody((err, body) => {
-            if (err || !body.token || !body.device_id) {
+        try {
+            const body = await readJsonBody();
+            if (!body.token || !body.device_id) {
                 return sendJson(400, { unlocked: false, message: 'Missing token or device_id' });
             }
 
-            const db = loadDB();
             const tokenStr = String(body.token).trim().toUpperCase();
             const deviceId = String(body.device_id).trim();
 
-            const found = db.tokens.find(t => t.token === tokenStr);
+            const result = await db.execute({
+                sql: 'SELECT * FROM tokens WHERE token = ?',
+                args: [tokenStr]
+            });
 
-            if (!found) {
+            if (result.rows.length === 0) {
                 return sendJson(404, { unlocked: false, reason: 'not_found', message: 'Token not found' });
             }
+
+            const found = result.rows[0];
 
             if (found.status === 'revoked') {
                 return sendJson(403, { unlocked: false, reason: 'revoked', message: 'Token has been revoked by admin' });
             }
 
-            if (found.deviceId && found.deviceId !== deviceId) {
+            if (found.device_id && found.device_id !== deviceId) {
                 return sendJson(403, { unlocked: false, reason: 'device_mismatch', message: 'Token is bound to another device' });
             }
 
             const now = Date.now();
-            if (found.expiresAt && now > found.expiresAt) {
-                found.status = 'expired';
-                saveDB(db);
+            if (found.expires_at && now > found.expires_at) {
+                await db.execute({
+                    sql: 'UPDATE tokens SET status = ? WHERE token = ?',
+                    args: ['expired', tokenStr]
+                });
                 return sendJson(403, {
                     unlocked: false,
                     reason: 'expired',
-                    expires_at: found.expiresAt,
-                    message: `Subscription expired on ${new Date(found.expiresAt).toLocaleDateString()}`
+                    expires_at: found.expires_at,
+                    message: `Subscription expired on ${new Date(Number(found.expires_at)).toLocaleDateString()}`
                 });
             }
 
-            // Valid active token
-            const daysLeft = found.expiresAt ? Math.max(0, Math.ceil((found.expiresAt - now) / (1000 * 60 * 60 * 24))) : 0;
+            const daysLeft = found.expires_at ? Math.max(0, Math.ceil((Number(found.expires_at) - now) / (1000 * 60 * 60 * 24))) : 0;
             return sendJson(200, {
                 unlocked: true,
                 token: found.token,
-                expires_at: found.expiresAt,
+                expires_at: found.expires_at,
                 days_left: daysLeft,
-                period_days: found.periodDays,
+                period_days: found.period_days,
                 message: 'Active license verified'
             });
-        });
-        return;
+        } catch (err) {
+            return sendJson(500, { unlocked: false, message: 'Server error: ' + err.message });
+        }
     }
 
     // API: Activate token on device
     // Request: { "token": "XXXXXXXX", "device_id": "..." }
     if (pathname === '/api/activate' && req.method === 'POST') {
-        readJsonBody((err, body) => {
-            if (err || !body.token || !body.device_id) {
+        try {
+            const body = await readJsonBody();
+            if (!body.token || !body.device_id) {
                 return sendJson(400, { success: false, unlocked: false, message: 'Missing token or device_id' });
             }
 
-            const db = loadDB();
             const tokenStr = String(body.token).trim().toUpperCase();
             const deviceId = String(body.device_id).trim();
 
-            const found = db.tokens.find(t => t.token === tokenStr);
+            const result = await db.execute({
+                sql: 'SELECT * FROM tokens WHERE token = ?',
+                args: [tokenStr]
+            });
 
-            if (!found) {
+            if (result.rows.length === 0) {
                 return sendJson(404, { success: false, unlocked: false, message: 'Invalid 8-character token' });
             }
+
+            const found = result.rows[0];
 
             if (found.status === 'revoked') {
                 return sendJson(403, { success: false, unlocked: false, message: 'Token has been revoked' });
             }
 
-            if (found.deviceId && found.deviceId !== deviceId) {
+            if (found.device_id && found.device_id !== deviceId) {
                 return sendJson(403, { success: false, unlocked: false, message: 'Token is already used on another device' });
             }
 
             const now = Date.now();
+            let expiresAt = found.expires_at;
 
-            // First activation: bind device and compute expiration based on periodDays
-            if (!found.deviceId) {
-                found.deviceId = deviceId;
-                found.activatedAt = now;
-                found.expiresAt = now + (found.periodDays * 24 * 60 * 60 * 1000);
-                found.status = 'active';
-                saveDB(db);
-            } else if (now > found.expiresAt) {
-                found.status = 'expired';
-                saveDB(db);
+            if (!found.device_id) {
+                expiresAt = now + (Number(found.period_days) * 24 * 60 * 60 * 1000);
+                await db.execute({
+                    sql: 'UPDATE tokens SET device_id = ?, activated_at = ?, expires_at = ?, status = ? WHERE token = ?',
+                    args: [deviceId, now, expiresAt, 'active', tokenStr]
+                });
+            } else if (now > found.expires_at) {
+                await db.execute({
+                    sql: 'UPDATE tokens SET status = ? WHERE token = ?',
+                    args: ['expired', tokenStr]
+                });
                 return sendJson(403, { success: false, unlocked: false, message: 'This token has already expired' });
             }
 
-            const daysLeft = Math.max(0, Math.ceil((found.expiresAt - now) / (1000 * 60 * 60 * 24)));
+            const daysLeft = Math.max(0, Math.ceil((Number(expiresAt) - now) / (1000 * 60 * 60 * 24)));
             return sendJson(200, {
                 success: true,
                 unlocked: true,
                 token: found.token,
-                expires_at: found.expiresAt,
+                expires_at: expiresAt,
                 days_left: daysLeft,
-                period_days: found.periodDays,
+                period_days: found.period_days,
                 message: 'App successfully unlocked!'
             });
-        });
-        return;
+        } catch (err) {
+            return sendJson(500, { success: false, unlocked: false, message: 'Server error: ' + err.message });
+        }
     }
 
     // API: List tokens (Admin)
     if (pathname === '/api/tokens' && req.method === 'GET') {
-        const db = loadDB();
-        const now = Date.now();
-        // Update expired statuses
-        let changed = false;
-        db.tokens.forEach(t => {
-            if (t.status === 'active' && t.expiresAt && now > t.expiresAt) {
-                t.status = 'expired';
-                changed = true;
-            }
-        });
-        if (changed) saveDB(db);
-        return sendJson(200, { tokens: db.tokens });
+        try {
+            const result = await db.execute('SELECT * FROM tokens ORDER BY created_at DESC');
+            const now = Date.now();
+            const formatted = result.rows.map(row => {
+                let status = row.status;
+                if (status === 'active' && row.expires_at && now > row.expires_at) {
+                    status = 'expired';
+                }
+                return {
+                    token: row.token,
+                    periodDays: Number(row.period_days),
+                    createdAt: Number(row.created_at),
+                    activatedAt: row.activated_at ? Number(row.activated_at) : null,
+                    expiresAt: row.expires_at ? Number(row.expires_at) : null,
+                    deviceId: row.device_id,
+                    note: row.note,
+                    status: status
+                };
+            });
+            return sendJson(200, { tokens: formatted });
+        } catch (err) {
+            return sendJson(500, { error: err.message });
+        }
     }
 
     // API: Generate new token (Admin)
-    // Request: { "period_days": 30, "note": "Customer 1" }
     if (pathname === '/api/tokens/generate' && req.method === 'POST') {
-        readJsonBody((err, body) => {
+        try {
+            const body = await readJsonBody();
             const periodDays = parseInt(body.period_days, 10) || 30;
             const note = body.note ? String(body.note).trim() : '';
 
-            const db = loadDB();
             let token = generate8CharToken();
-            while (db.tokens.some(t => t.token === token)) {
+            let check = await db.execute({ sql: 'SELECT token FROM tokens WHERE token = ?', args: [token] });
+            while (check.rows.length > 0) {
                 token = generate8CharToken();
+                check = await db.execute({ sql: 'SELECT token FROM tokens WHERE token = ?', args: [token] });
             }
 
-            const newToken = {
-                token: token,
-                periodDays: periodDays,
-                createdAt: Date.now(),
-                activatedAt: null,
-                expiresAt: null,
-                deviceId: null,
-                note: note,
-                status: 'available' // available, active, expired, revoked
-            };
+            const now = Date.now();
+            await db.execute({
+                sql: `INSERT INTO tokens (token, period_days, created_at, activated_at, expires_at, device_id, note, status)
+                      VALUES (?, ?, ?, NULL, NULL, NULL, ?, ?)`,
+                args: [token, periodDays, now, note, 'available']
+            });
 
-            db.tokens.unshift(newToken);
-            saveDB(db);
-
-            return sendJson(201, { success: true, token: newToken });
-        });
-        return;
+            return sendJson(201, {
+                success: true,
+                token: {
+                    token: token,
+                    periodDays: periodDays,
+                    createdAt: now,
+                    activatedAt: null,
+                    expiresAt: null,
+                    deviceId: null,
+                    note: note,
+                    status: 'available'
+                }
+            });
+        } catch (err) {
+            return sendJson(500, { success: false, message: 'Server error: ' + err.message });
+        }
     }
 
-    // API: Revoke / Delete token (Admin)
+    // API: Revoke token
     if (pathname === '/api/tokens/revoke' && req.method === 'POST') {
-        readJsonBody((err, body) => {
+        try {
+            const body = await readJsonBody();
             if (!body.token) return sendJson(400, { success: false, message: 'Missing token' });
-            const db = loadDB();
-            const found = db.tokens.find(t => t.token === body.token);
-            if (found) {
-                found.status = 'revoked';
-                saveDB(db);
-                return sendJson(200, { success: true, message: 'Token revoked' });
-            }
-            return sendJson(404, { success: false, message: 'Token not found' });
-        });
-        return;
+            await db.execute({
+                sql: 'UPDATE tokens SET status = ? WHERE token = ?',
+                args: ['revoked', String(body.token).trim().toUpperCase()]
+            });
+            return sendJson(200, { success: true, message: 'Token revoked' });
+        } catch (err) {
+            return sendJson(500, { success: false, message: err.message });
+        }
     }
 
+    // API: Delete token
     if (pathname === '/api/tokens/delete' && req.method === 'POST') {
-        readJsonBody((err, body) => {
+        try {
+            const body = await readJsonBody();
             if (!body.token) return sendJson(400, { success: false, message: 'Missing token' });
-            const db = loadDB();
-            db.tokens = db.tokens.filter(t => t.token !== body.token);
-            saveDB(db);
+            await db.execute({
+                sql: 'DELETE FROM tokens WHERE token = ?',
+                args: [String(body.token).trim().toUpperCase()]
+            });
             return sendJson(200, { success: true, message: 'Token deleted' });
-        });
-        return;
+        } catch (err) {
+            return sendJson(500, { success: false, message: err.message });
+        }
     }
 
     // Web Dashboard (GET /)
@@ -275,7 +315,7 @@ function getDashboardHtml() {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Saned Assistant - License Admin Dashboard</title>
+<title>Saned Assistant - Turso Cloud Dashboard</title>
 <style>
   :root {
     --bg: #0f172a;
@@ -295,6 +335,7 @@ function getDashboardHtml() {
   header { margin-bottom: 2rem; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 1rem; }
   h1 { font-size: 1.8rem; font-weight: 700; color: #fff; display: flex; align-items: center; gap: 0.5rem; }
   .badge-app { font-size: 0.75rem; background: var(--accent); color: white; padding: 0.2rem 0.6rem; border-radius: 9999px; }
+  .badge-turso { font-size: 0.75rem; background: #059669; color: white; padding: 0.2rem 0.6rem; border-radius: 9999px; }
   .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 1.5rem; margin-bottom: 2rem; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.3); }
   .card-title { font-size: 1.2rem; font-weight: 600; margin-bottom: 1rem; color: #e2e8f0; }
   .form-row { display: flex; gap: 1rem; flex-wrap: wrap; align-items: flex-end; }
@@ -327,10 +368,10 @@ function getDashboardHtml() {
 <div class="container">
   <header>
     <div>
-      <h1>Saned Assistant <span class="badge-app">Server Verification</span></h1>
-      <p style="color: var(--text-muted); font-size: 0.9rem; margin-top: 0.2rem;">Token Generator & Active License Manager</p>
+      <h1>Saned Assistant <span class="badge-app">Verification</span> <span class="badge-turso">Turso Cloud DB</span></h1>
+      <p style="color: var(--text-muted); font-size: 0.9rem; margin-top: 0.2rem;">Permanent Cloud License Manager & Token Generator</p>
     </div>
-    <div style="color: var(--text-muted); font-size: 0.85rem;" id="server-status">● Server Online (Port ${PORT})</div>
+    <div style="color: #34d399; font-size: 0.85rem;" id="server-status">● Cloud SQLite Connected</div>
   </header>
 
   <div class="stats-grid">
@@ -376,7 +417,7 @@ function getDashboardHtml() {
   </div>
 
   <div class="card">
-    <div class="card-title">🔑 Tokens & Device Bindings</div>
+    <div class="card-title">🔑 Tokens & Device Bindings (Persisted in Turso)</div>
     <div style="overflow-x: auto;">
       <table class="token-table">
         <thead>
@@ -391,7 +432,7 @@ function getDashboardHtml() {
           </tr>
         </thead>
         <tbody id="tokens-body">
-          <tr><td colspan="7" style="text-align: center; color: var(--text-muted);">Loading tokens...</td></tr>
+          <tr><td colspan="7" style="text-align: center; color: var(--text-muted);">Loading tokens from Turso...</td></tr>
         </tbody>
       </table>
     </div>
@@ -416,7 +457,7 @@ function renderTokens(tokens) {
   document.getElementById('stat-available').innerText = tokens.filter(t => t.status === 'available').length;
 
   if (tokens.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="7" style="text-align: center; color: var(--text-muted); padding: 2rem;">No tokens generated yet. Click "Generate Token" above.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="7" style="text-align: center; color: var(--text-muted); padding: 2rem;">No tokens in Turso database yet. Click "Generate Token" above.</td></tr>';
     return;
   }
 
@@ -498,6 +539,5 @@ setInterval(fetchTokens, 10000);
 }
 
 server.listen(PORT, '0.0.0.0', () => {
-    console.log(`[Verification Server] Running at http://localhost:${PORT}`);
-    console.log(`[Verification Server] Accessible on local network or via adb reverse`);
+    console.log(`[Verification Server] Running on port ${PORT} connected to Turso Cloud DB`);
 });
