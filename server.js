@@ -576,4 +576,19 @@ setInterval(fetchTokens, 10000);
 
 server.listen(PORT, '0.0.0.0', () => {
     console.log(`[Verification Server] Running on port ${PORT} connected to Turso Cloud DB`);
+
+    // Keep-alive ping for free-tier hosting (e.g. Render) to prevent sleep after 15 min inactivity
+    const keepAliveUrl = process.env.RENDER_EXTERNAL_URL || 'https://saned-license-server.onrender.com';
+    setInterval(() => {
+        try {
+            const https = require('https');
+            https.get(`${keepAliveUrl}/api/health`, (res) => {
+                console.log(`[Keep-Alive] Pinged ${keepAliveUrl}/api/health -> Status: ${res.statusCode}`);
+            }).on('error', (err) => {
+                console.error('[Keep-Alive] Ping error:', err.message);
+            });
+        } catch (e) {
+            console.error('[Keep-Alive] Exception:', e.message);
+        }
+    }, 8 * 60 * 1000); // Ping every 8 minutes (well under Render's 15-minute idle limit)
 });
