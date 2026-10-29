@@ -70,6 +70,21 @@ Master:
 ## Database migration
 On startup the server creates `users`, `sessions` and `reseller_quotas`, and adds `tokens.reseller_id` if missing. Existing tokens have `reseller_id = NULL`, which means they are owned by master and remain valid.
 
+## Manual Turso setup (optional)
+The server migrates automatically, but you can also prepare the database yourself:
+
+```bash
+node scripts/generate-setup-sql.js --username master --password "YourStrongPassword"
+```
+
+This writes `turso-setup.sql` (gitignored) containing the full schema, indexes, the hashed master password and default reseller quotas. Run it with:
+
+```bash
+turso db shell <your-database-name> < turso-setup.sql
+```
+
+If `tokens.reseller_id` already exists, skip the `ALTER TABLE` line. The master upsert resets the master password and clears its sessions, so re-running the file is safe apart from that one `ALTER` statement.
+
 ## Deploy on Render
 1. Set `TURSO_DATABASE_URL`, `TURSO_AUTH_TOKEN`, `MASTER_USERNAME`, `MASTER_PASSWORD` in the Render dashboard.
 2. Deploy. The schema migration runs automatically on boot.

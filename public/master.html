@@ -140,6 +140,25 @@
       </table>
     </div>
   </div>
+
+  <div class="card">
+    <div class="card-title">Change Master Password</div>
+    <form id="password-form" class="form-row">
+      <div class="form-group">
+        <label for="current-password">Current Password</label>
+        <input type="password" id="current-password" autocomplete="current-password" required>
+      </div>
+      <div class="form-group">
+        <label for="new-password">New Password (min 8 chars)</label>
+        <input type="password" id="new-password" autocomplete="new-password" required>
+      </div>
+      <div class="form-group">
+        <label for="confirm-password">Confirm New Password</label>
+        <input type="password" id="confirm-password" autocomplete="new-password" required>
+      </div>
+      <div><button type="submit" class="btn-ghost">Update Password</button></div>
+    </form>
+  </div>
 </div>
 
 <div class="modal-backdrop" id="quota-modal">
@@ -488,6 +507,33 @@ document.getElementById('create-reseller-form').addEventListener('submit', async
     document.getElementById('new-password').value = '';
     toast('Reseller ' + username + ' created. Set their quotas next.', 'success');
     await refresh();
+  } catch (err) {
+    toast(err.message, 'error');
+  }
+});
+
+document.getElementById('password-form').addEventListener('submit', async function (event) {
+  event.preventDefault();
+  const currentPassword = document.getElementById('current-password').value;
+  const newPassword = document.getElementById('new-password').value;
+  const confirmPassword = document.getElementById('confirm-password').value;
+
+  if (newPassword.length < 8) {
+    toast('New password must be at least 8 characters', 'error');
+    return;
+  }
+  if (newPassword !== confirmPassword) {
+    toast('New passwords do not match', 'error');
+    return;
+  }
+
+  try {
+    await api('/api/auth/change-password', {
+      method: 'POST',
+      body: JSON.stringify({ current_password: currentPassword, new_password: newPassword })
+    });
+    document.getElementById('password-form').reset();
+    toast('Password updated', 'success');
   } catch (err) {
     toast(err.message, 'error');
   }
