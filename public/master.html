@@ -1,0 +1,519 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Master Panel - Saned License</title>
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<div class="container">
+  <div class="topbar">
+    <div class="brand">
+      <h1>Saned Assistant</h1>
+      <span class="badge badge-master">Master</span>
+      <span class="badge badge-cloud">Turso</span>
+    </div>
+    <div class="user-area">
+      <span>Signed in as <strong id="user-label">-</strong></span>
+      <button class="btn-ghost btn-small" id="logout-btn">Logout</button>
+    </div>
+  </div>
+
+  <div class="stats-grid">
+    <div class="stat-card"><div class="stat-label">Total Licenses</div><div class="stat-value" id="stat-total" style="color:#60a5fa;">0</div></div>
+    <div class="stat-card"><div class="stat-label">Active</div><div class="stat-value" id="stat-active" style="color:#34d399;">0</div></div>
+    <div class="stat-card"><div class="stat-label">Available</div><div class="stat-value" id="stat-available" style="color:#cbd5e1;">0</div></div>
+    <div class="stat-card"><div class="stat-label">Expired</div><div class="stat-value" id="stat-expired" style="color:#fbbf24;">0</div></div>
+    <div class="stat-card"><div class="stat-label">Revoked</div><div class="stat-value" id="stat-revoked" style="color:#f87171;">0</div></div>
+    <div class="stat-card"><div class="stat-label">Resellers</div><div class="stat-value" id="stat-resellers" style="color:#a78bfa;">0</div></div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Generate Token <span class="hint">Assigning to a reseller consumes their quota</span></div>
+    <form id="gen-form" class="form-row">
+      <div class="form-group" style="flex:1.4;">
+        <label for="device-id-input">Target Device ID *</label>
+        <input type="text" id="device-id-input" placeholder="e.g. cf4ade3f1edec2c7" required style="font-family:monospace;">
+      </div>
+      <div class="form-group">
+        <label for="period-select">Subscription Period</label>
+        <select id="period-select">
+          <option value="1">1 Day</option>
+          <option value="3">3 Days</option>
+          <option value="7">7 Days (1 Week)</option>
+          <option value="30" selected>30 Days (1 Month)</option>
+          <option value="60">60 Days (2 Months)</option>
+          <option value="90">90 Days (3 Months)</option>
+          <option value="365">365 Days (1 Year)</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label for="note-input">Customer Note</label>
+        <input type="text" id="note-input" placeholder="e.g. Driver Ahmed">
+      </div>
+      <div class="form-group">
+        <label for="owner-select">Token Owner</label>
+        <select id="owner-select">
+          <option value="">Master (no quota)</option>
+        </select>
+      </div>
+      <div><button type="submit">+ Issue Token</button></div>
+    </form>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Resellers</div>
+    <form id="create-reseller-form" class="form-row">
+      <div class="form-group">
+        <label for="new-username">Username</label>
+        <input type="text" id="new-username" placeholder="reseller_name" autocomplete="off" required>
+      </div>
+      <div class="form-group">
+        <label for="new-password">Password (min 8 chars)</label>
+        <input type="password" id="new-password" placeholder="Temporary password" autocomplete="new-password" required>
+      </div>
+      <div><button type="submit" class="btn-success">+ Create Reseller</button></div>
+    </form>
+
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Reseller</th>
+            <th>Status</th>
+            <th>Tokens</th>
+            <th>Quotas (used / max)</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody id="resellers-body">
+          <tr class="empty-row"><td colspan="5">Loading resellers...</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Licenses</div>
+    <div class="filters">
+      <div class="form-group">
+        <label for="filter-owner">Owner</label>
+        <select id="filter-owner">
+          <option value="all">All owners</option>
+          <option value="master">Master</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label for="filter-status">Status</label>
+        <select id="filter-status">
+          <option value="all">All statuses</option>
+          <option value="available">Available</option>
+          <option value="active">Active</option>
+          <option value="expired">Expired</option>
+          <option value="revoked">Revoked</option>
+        </select>
+      </div>
+      <div class="form-group" style="flex:2;">
+        <label for="filter-search">Search</label>
+        <input type="text" id="filter-search" placeholder="Token, device ID, note or owner">
+      </div>
+    </div>
+
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Token</th>
+            <th>Device ID</th>
+            <th>Duration</th>
+            <th>Owner</th>
+            <th>Status</th>
+            <th>Expires</th>
+            <th>Note</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody id="tokens-body">
+          <tr class="empty-row"><td colspan="8">Loading licenses...</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<div class="modal-backdrop" id="quota-modal">
+  <div class="modal">
+    <h2>Set Quotas</h2>
+    <p class="modal-sub" id="quota-modal-sub">0 = blocked for that period.</p>
+    <div id="quota-edit-rows"></div>
+    <div class="modal-actions">
+      <button class="btn-ghost" id="quota-cancel">Cancel</button>
+      <button id="quota-save">Save Quotas</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast-container" id="toasts"></div>
+
+<script>
+const PERIOD_LABELS = { 1: '1 Day', 3: '3 Days', 7: '7 Days', 30: '30 Days', 60: '60 Days', 90: '90 Days', 365: '365 Days' };
+const state = { me: null, resellers: [], tokens: [], stats: {} };
+let quotaUserId = null;
+
+function esc(value) {
+  return String(value == null ? '' : value).replace(/[&<>"']/g, function (c) {
+    return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+  });
+}
+
+function toast(message, type) {
+  const el = document.createElement('div');
+  el.className = 'toast ' + (type || '');
+  el.textContent = message;
+  document.getElementById('toasts').appendChild(el);
+  setTimeout(function () { el.remove(); }, 4000);
+}
+
+async function api(url, options) {
+  const opts = options || {};
+  const res = await fetch(url, Object.assign({ headers: { 'Content-Type': 'application/json' } }, opts));
+  if (res.status === 401) {
+    window.location.href = '/login';
+    throw new Error('Session expired');
+  }
+  const data = await res.json().catch(function () { return {}; });
+  if (!res.ok) throw new Error(data.message || 'Request failed');
+  return data;
+}
+
+async function init() {
+  const me = await api('/api/auth/me');
+  if (!me.user || me.user.role !== 'master') {
+    window.location.href = '/login';
+    return;
+  }
+  state.me = me.user;
+  document.getElementById('user-label').textContent = me.user.username;
+  await refresh();
+}
+
+async function refresh() {
+  const results = await Promise.all([
+    api('/api/admin/stats'),
+    api('/api/admin/resellers'),
+    api('/api/tokens')
+  ]);
+  state.stats = results[0];
+  state.resellers = results[1].resellers;
+  state.tokens = results[2].tokens;
+  renderStats();
+  renderOwnerOptions();
+  renderResellers();
+  renderTokens();
+}
+
+function renderStats() {
+  const s = state.stats;
+  document.getElementById('stat-total').textContent = s.total || 0;
+  document.getElementById('stat-active').textContent = s.active || 0;
+  document.getElementById('stat-available').textContent = s.available || 0;
+  document.getElementById('stat-expired').textContent = s.expired || 0;
+  document.getElementById('stat-revoked').textContent = s.revoked || 0;
+  document.getElementById('stat-resellers').textContent = s.resellers || 0;
+}
+
+function renderOwnerOptions() {
+  const ownerSelect = document.getElementById('owner-select');
+  const ownerPrev = ownerSelect.value;
+  ownerSelect.innerHTML = '<option value="">Master (no quota)</option>' +
+    state.resellers.filter(function (r) { return r.status === 'active'; }).map(function (r) {
+      return '<option value="' + r.id + '">' + esc(r.username) + '</option>';
+    }).join('');
+  if (ownerPrev && Array.prototype.some.call(ownerSelect.options, function (o) { return o.value === ownerPrev; })) {
+    ownerSelect.value = ownerPrev;
+  }
+
+  const filterSelect = document.getElementById('filter-owner');
+  const filterPrev = filterSelect.value;
+  filterSelect.innerHTML = '<option value="all">All owners</option><option value="master">Master</option>' +
+    state.resellers.map(function (r) {
+      return '<option value="' + r.id + '">' + esc(r.username) + '</option>';
+    }).join('');
+  if (filterPrev && Array.prototype.some.call(filterSelect.options, function (o) { return o.value === filterPrev; })) {
+    filterSelect.value = filterPrev;
+  }
+}
+
+function renderResellers() {
+  const tbody = document.getElementById('resellers-body');
+  if (state.resellers.length === 0) {
+    tbody.innerHTML = '<tr class="empty-row"><td colspan="5">No resellers yet. Create one above.</td></tr>';
+    return;
+  }
+
+  tbody.innerHTML = state.resellers.map(function (r) {
+    const configured = r.quotas.filter(function (q) { return q.maxTokens > 0; });
+    const summary = configured.length
+      ? configured.map(function (q) { return q.periodDays + 'd <span>' + q.usedCount + '/' + q.maxTokens + '</span>'; }).join(' &middot; ')
+      : '<span>All periods blocked</span>';
+    const statusClass = r.status === 'active' ? 'status-active-user' : 'status-disabled';
+
+    return '<tr>' +
+      '<td><strong>' + esc(r.username) + '</strong><div class="muted small">' + new Date(r.createdAt).toLocaleDateString() + '</div></td>' +
+      '<td><span class="status-tag ' + statusClass + '">' + esc(r.status) + '</span></td>' +
+      '<td>' + r.tokenCount + '</td>' +
+      '<td><div class="quota-summary">' + summary + '</div></td>' +
+      '<td><div class="btn-row">' +
+        '<button class="btn-small" onclick="openQuotaModal(\'' + r.id + '\')">Quotas</button>' +
+        '<button class="btn-ghost btn-small" onclick="resetUsage(\'' + r.id + '\')">Reset usage</button>' +
+        '<button class="btn-ghost btn-small" onclick="resetPassword(\'' + r.id + '\')">Reset password</button>' +
+        '<button class="' + (r.status === 'active' ? 'btn-danger' : 'btn-success') + ' btn-small" onclick="toggleStatus(\'' + r.id + '\')">' + (r.status === 'active' ? 'Disable' : 'Enable') + '</button>' +
+        '<button class="btn-danger btn-small" onclick="deleteReseller(\'' + r.id + '\')">Delete</button>' +
+      '</div></td>' +
+    '</tr>';
+  }).join('');
+}
+
+function expiryText(t) {
+  if (!t.expiresAt) return '<span class="muted">Not activated</span>';
+  const days = Math.max(0, Math.ceil((t.expiresAt - Date.now()) / 86400000));
+  return new Date(t.expiresAt).toLocaleDateString() + ' <span class="muted small">(' + days + 'd left)</span>';
+}
+
+function filteredTokens() {
+  const owner = document.getElementById('filter-owner').value;
+  const status = document.getElementById('filter-status').value;
+  const query = document.getElementById('filter-search').value.trim().toLowerCase();
+
+  return state.tokens.filter(function (t) {
+    if (owner === 'master' && t.resellerId) return false;
+    if (owner !== 'all' && owner !== 'master' && t.resellerId !== owner) return false;
+    if (status !== 'all' && t.status !== status) return false;
+    if (query) {
+      const haystack = (t.token + ' ' + t.deviceId + ' ' + (t.note || '') + ' ' + (t.ownerName || '')).toLowerCase();
+      if (haystack.indexOf(query) === -1) return false;
+    }
+    return true;
+  });
+}
+
+function renderTokens() {
+  const tbody = document.getElementById('tokens-body');
+  const tokens = filteredTokens();
+
+  if (tokens.length === 0) {
+    tbody.innerHTML = '<tr class="empty-row"><td colspan="8">No licenses match the current filters.</td></tr>';
+    return;
+  }
+
+  tbody.innerHTML = tokens.map(function (t) {
+    const canRevoke = t.status === 'active' || t.status === 'available';
+    return '<tr>' +
+      '<td><span class="token-box">' + esc(t.token) + '</span></td>' +
+      '<td><span class="device-box">' + esc(t.deviceId) + '</span></td>' +
+      '<td>' + t.periodDays + ' Days</td>' +
+      '<td>' + esc(t.ownerName) + '</td>' +
+      '<td><span class="status-tag status-' + esc(t.status) + '">' + esc(t.status) + '</span></td>' +
+      '<td>' + expiryText(t) + '</td>' +
+      '<td class="muted">' + (t.note ? esc(t.note) : '-') + '</td>' +
+      '<td><div class="btn-row">' +
+        '<button class="btn-ghost btn-small" onclick="copyToken(\'' + t.token + '\')">Copy</button>' +
+        (canRevoke ? '<button class="btn-danger btn-small" onclick="revokeToken(\'' + t.token + '\')">Revoke</button>' : '') +
+        '<button class="btn-ghost btn-small" onclick="deleteToken(\'' + t.token + '\')">Delete</button>' +
+      '</div></td>' +
+    '</tr>';
+  }).join('');
+}
+
+function openQuotaModal(id) {
+  const reseller = state.resellers.find(function (r) { return r.id === id; });
+  if (!reseller) return;
+  quotaUserId = id;
+  document.getElementById('quota-modal-sub').textContent = 'Quotas for ' + reseller.username + '. 0 = blocked.';
+  document.getElementById('quota-edit-rows').innerHTML = reseller.quotas.map(function (q) {
+    return '<div class="quota-edit-row">' +
+      '<div><span class="q-label">' + (PERIOD_LABELS[q.periodDays] || q.periodDays + ' Days') + '</span>' +
+      '<span class="q-used">used ' + q.usedCount + '</span></div>' +
+      '<input type="number" min="0" step="1" data-period="' + q.periodDays + '" value="' + q.maxTokens + '">' +
+    '</div>';
+  }).join('');
+  document.getElementById('quota-modal').classList.add('open');
+}
+
+function closeQuotaModal() {
+  document.getElementById('quota-modal').classList.remove('open');
+  quotaUserId = null;
+}
+
+async function saveQuotas() {
+  if (!quotaUserId) return;
+  const quotas = {};
+  document.querySelectorAll('#quota-edit-rows input[data-period]').forEach(function (input) {
+    quotas[input.dataset.period] = parseInt(input.value, 10) || 0;
+  });
+
+  try {
+    await api('/api/admin/resellers/quotas', {
+      method: 'POST',
+      body: JSON.stringify({ user_id: quotaUserId, quotas: quotas })
+    });
+    toast('Quotas updated', 'success');
+    closeQuotaModal();
+    await refresh();
+  } catch (err) {
+    toast(err.message, 'error');
+  }
+}
+
+async function resetUsage(id) {
+  const reseller = state.resellers.find(function (r) { return r.id === id; });
+  if (!confirm('Reset all usage counters for ' + (reseller ? reseller.username : 'this reseller') + '?')) return;
+  try {
+    await api('/api/admin/resellers/reset-usage', { method: 'POST', body: JSON.stringify({ user_id: id }) });
+    toast('Usage reset', 'success');
+    await refresh();
+  } catch (err) {
+    toast(err.message, 'error');
+  }
+}
+
+async function resetPassword(id) {
+  const reseller = state.resellers.find(function (r) { return r.id === id; });
+  const password = prompt('New password for ' + (reseller ? reseller.username : 'reseller') + ' (min 8 characters):');
+  if (password === null) return;
+  if (password.length < 8) {
+    toast('Password must be at least 8 characters', 'error');
+    return;
+  }
+  try {
+    await api('/api/admin/resellers/update', { method: 'POST', body: JSON.stringify({ user_id: id, password: password }) });
+    toast('Password updated', 'success');
+  } catch (err) {
+    toast(err.message, 'error');
+  }
+}
+
+async function toggleStatus(id) {
+  const reseller = state.resellers.find(function (r) { return r.id === id; });
+  if (!reseller) return;
+  const next = reseller.status === 'active' ? 'disabled' : 'active';
+  if (!confirm((next === 'disabled' ? 'Disable' : 'Enable') + ' ' + reseller.username + '?')) return;
+  try {
+    await api('/api/admin/resellers/update', { method: 'POST', body: JSON.stringify({ user_id: id, status: next }) });
+    toast('Reseller ' + next, 'success');
+    await refresh();
+  } catch (err) {
+    toast(err.message, 'error');
+  }
+}
+
+async function deleteReseller(id) {
+  const reseller = state.resellers.find(function (r) { return r.id === id; });
+  if (!reseller) return;
+  if (!confirm('Delete reseller ' + reseller.username + '?\n\nTheir tokens will be transferred to Master so customers stay licensed.')) return;
+  try {
+    await api('/api/admin/resellers/delete', { method: 'POST', body: JSON.stringify({ user_id: id }) });
+    toast('Reseller deleted', 'success');
+    await refresh();
+  } catch (err) {
+    toast(err.message, 'error');
+  }
+}
+
+async function copyToken(token) {
+  try {
+    await navigator.clipboard.writeText(token);
+    toast('Copied ' + token, 'success');
+  } catch (err) {
+    prompt('Copy token:', token);
+  }
+}
+
+async function revokeToken(token) {
+  if (!confirm('Revoke token ' + token + '? The device will be locked out immediately.')) return;
+  try {
+    await api('/api/tokens/revoke', { method: 'POST', body: JSON.stringify({ token: token }) });
+    toast('Token revoked', 'success');
+    await refresh();
+  } catch (err) {
+    toast(err.message, 'error');
+  }
+}
+
+async function deleteToken(token) {
+  if (!confirm('Delete token ' + token + ' permanently?')) return;
+  try {
+    await api('/api/tokens/delete', { method: 'POST', body: JSON.stringify({ token: token }) });
+    toast('Token deleted', 'success');
+    await refresh();
+  } catch (err) {
+    toast(err.message, 'error');
+  }
+}
+
+document.getElementById('gen-form').addEventListener('submit', async function (event) {
+  event.preventDefault();
+  const deviceId = document.getElementById('device-id-input').value.trim();
+  const periodDays = document.getElementById('period-select').value;
+  const note = document.getElementById('note-input').value.trim();
+  const resellerId = document.getElementById('owner-select').value;
+
+  if (!deviceId) {
+    toast('Please enter the target Device ID', 'error');
+    return;
+  }
+
+  try {
+    const payload = { device_id: deviceId, period_days: periodDays, note: note };
+    if (resellerId) payload.reseller_id = resellerId;
+    const data = await api('/api/tokens/generate', { method: 'POST', body: JSON.stringify(payload) });
+    document.getElementById('device-id-input').value = '';
+    document.getElementById('note-input').value = '';
+    toast('Token ' + data.token.token + ' created for ' + deviceId, 'success');
+    await refresh();
+  } catch (err) {
+    toast(err.message, 'error');
+  }
+});
+
+document.getElementById('create-reseller-form').addEventListener('submit', async function (event) {
+  event.preventDefault();
+  const username = document.getElementById('new-username').value.trim();
+  const password = document.getElementById('new-password').value;
+
+  try {
+    await api('/api/admin/resellers', { method: 'POST', body: JSON.stringify({ username: username, password: password }) });
+    document.getElementById('new-username').value = '';
+    document.getElementById('new-password').value = '';
+    toast('Reseller ' + username + ' created. Set their quotas next.', 'success');
+    await refresh();
+  } catch (err) {
+    toast(err.message, 'error');
+  }
+});
+
+document.getElementById('logout-btn').addEventListener('click', async function () {
+  try { await api('/api/auth/logout', { method: 'POST' }); } catch (err) { /* ignore */ }
+  window.location.href = '/login';
+});
+
+document.getElementById('quota-cancel').addEventListener('click', closeQuotaModal);
+document.getElementById('quota-save').addEventListener('click', saveQuotas);
+document.getElementById('quota-modal').addEventListener('click', function (event) {
+  if (event.target === this) closeQuotaModal();
+});
+
+['filter-owner', 'filter-status', 'filter-search'].forEach(function (id) {
+  document.getElementById(id).addEventListener('input', renderTokens);
+  document.getElementById(id).addEventListener('change', renderTokens);
+});
+
+init().catch(function (err) {
+  console.error(err);
+  toast(err.message, 'error');
+});
+setInterval(function () { refresh().catch(function () {}); }, 15000);
+</script>
+</body>
+</html>

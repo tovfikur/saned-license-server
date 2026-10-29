@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Reseller Panel - Saned License</title>
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<div class="container">
+  <div class="topbar">
+    <div class="brand">
+      <h1>Saned Assistant</h1>
+      <span class="badge badge-reseller">Reseller</span>
+      <span class="badge badge-cloud">Turso</span>
+    </div>
+    <div class="user-area">
+      <span>Signed in as <strong id="user-label">-</strong></span>
+      <button class="btn-ghost btn-small" id="logout-btn">Logout</button>
+    </div>
+  </div>
+
+  <div class="stats-grid">
+    <div class="stat-card"><div class="stat-label">My Tokens</div><div class="stat-value" id="stat-total" style="color:#60a5fa;">0</div></div>
+    <div class="stat-card"><div class="stat-label">Active</div><div class="stat-value" id="stat-active" style="color:#34d399;">0</div></div>
+    <div class="stat-card"><div class="stat-label">Available</div><div class="stat-value" id="stat-available" style="color:#cbd5e1;">0</div></div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">My Quotas <span class="hint">Set by master. 0 means blocked.</span></div>
+    <div class="quota-grid" id="quota-grid">
+      <div class="muted small">Loading quotas...</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Generate Token</div>
+    <form id="gen-form" class="form-row">
+      <div class="form-group" style="flex:1.4;">
+        <label for="device-id-input">Target Device ID *</label>
+        <input type="text" id="device-id-input" placeholder="e.g. cf4ade3f1edec2c7" required style="font-family:monospace;">
+      </div>
+      <div class="form-group">
+        <label for="period-select">Subscription Period</label>
+        <select id="period-select">
+          <option value="">Loading...</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label for="note-input">Customer Note</label>
+        <input type="text" id="note-input" placeholder="e.g. Driver Ahmed">
+      </div>
+      <div><button type="submit" id="gen-btn">+ Issue Token</button></div>
+    </form>
+  </div>
+
+  <div class="card">
+    <div class="card-title">My Licenses</div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Token</th>
+            <th>Device ID</th>
+            <th>Duration</th>
+            <th>Status</th>
+            <th>Expires</th>
+            <th>Note</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody id="tokens-body">
+          <tr class="empty-row"><td colspan="7">Loading licenses...</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Change Password</div>
+    <form id="password-form" class="form-row">
+      <div class="form-group">
+        <label for="current-password">Current Password</label>
+        <input type="password" id="current-password" autocomplete="current-password" required>
+      </div>
+      <div class="form-group">
+        <label for="new-password">New Password (min 8 chars)</label>
+        <input type="password" id="new-password" autocomplete="new-password" required>
+      </div>
+      <div class="form-group">
+        <label for="confirm-password">Confirm New Password</label>
+        <input type="password" id="confirm-password" autocomplete="new-password" required>
+      </div>
+      <div><button type="submit" class="btn-ghost">Update Password</button></div>
+    </form>
+  </div>
+</div>
+
+<div class="toast-container" id="toasts"></div>
+
+<script>
+const PERIOD_LABELS = { 1: '1 Day', 3: '3 Days', 7: '7 Days', 30: '30 Days', 60: '60 Days', 90: '90 Days', 365: '365 Days' };
+const state = { me: null, quotas: [], tokens: [] };
+
+function esc(value) {
+  return String(value == null ? '' : value).replace(/[&<>"']/g, function (c) {
+    return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+  });
+}
+
+function toast(message, type) {
+  const el = document.createElement('div');
+  el.className = 'toast ' + (type || '');
+  el.textContent = message;
+  document.getElementById('toasts').appendChild(el);
+  setTimeout(function () { el.remove(); }, 4000);
+}
+
+async function api(url, options) {
+  const opts = options || {};
+  const res = await fetch(url, Object.assign({ headers: { 'Content-Type': 'application/json' } }, opts));
+  if (res.status === 401) {
+    window.location.href = '/login';
+    throw new Error('Session expired');
+  }
+  const data = await res.json().catch(function () { return {}; });
+  if (!res.ok) throw new Error(data.message || 'Request failed');
+  return data;
+}
+
+async function init() {
+  const me = await api('/api/auth/me');
+  if (!me.user || me.user.role !== 'reseller') {
+    window.location.href = '/login';
+    return;
+  }
+  state.me = me.user;
+  document.getElementById('user-label').textContent = me.user.username;
+  await refresh();
+}
+
+async function refresh() {
+  const results = await Promise.all([
+    api('/api/me/quotas'),
+    api('/api/tokens')
+  ]);
+  state.quotas = results[0].quotas;
+  state.tokens = results[1].tokens;
+  renderStats();
+  renderQuotas();
+  renderPeriodOptions();
+  renderTokens();
+}
+
+function renderStats() {
+  document.getElementById('stat-total').textContent = state.tokens.length;
+  document.getElementById('stat-active').textContent = state.tokens.filter(function (t) { return t.status === 'active'; }).length;
+  document.getElementById('stat-available').textContent = state.tokens.filter(function (t) { return t.status === 'available'; }).length;
+}
+
+function renderQuotas() {
+  const grid = document.getElementById('quota-grid');
+  if (state.quotas.length === 0) {
+    grid.innerHTML = '<div class="muted small">No quotas configured.</div>';
+    return;
+  }
+
+  grid.innerHTML = state.quotas.map(function (q) {
+    const blocked = q.maxTokens <= 0;
+    const remaining = Math.max(0, q.maxTokens - q.usedCount);
+    const cls = blocked ? 'blocked' : (remaining <= 1 ? 'low' : 'ok');
+    return '<div class="quota-card ' + cls + '">' +
+      '<div class="period">' + (PERIOD_LABELS[q.periodDays] || q.periodDays + ' Days') + '</div>' +
+      '<div class="numbers">' + (blocked ? 'Blocked' : q.usedCount + ' / ' + q.maxTokens) + '</div>' +
+      '<div class="remaining">' + (blocked ? 'Ask master for quota' : remaining + ' remaining') + '</div>' +
+    '</div>';
+  }).join('');
+}
+
+function renderPeriodOptions() {
+  const select = document.getElementById('period-select');
+  const button = document.getElementById('gen-btn');
+  const previous = select.value;
+
+  const available = state.quotas.filter(function (q) {
+    return q.maxTokens > 0 && q.usedCount < q.maxTokens;
+  });
+
+  if (available.length === 0) {
+    select.innerHTML = '<option value="">No quota available</option>';
+    select.disabled = true;
+    button.disabled = true;
+    return;
+  }
+
+  select.disabled = false;
+  button.disabled = false;
+  select.innerHTML = available.map(function (q) {
+    const remaining = q.maxTokens - q.usedCount;
+    return '<option value="' + q.periodDays + '">' + (PERIOD_LABELS[q.periodDays] || q.periodDays + ' Days') + ' (' + remaining + ' left)</option>';
+  }).join('');
+
+  if (previous && available.some(function (q) { return String(q.periodDays) === previous; })) {
+    select.value = previous;
+  }
+}
+
+function expiryText(t) {
+  if (!t.expiresAt) return '<span class="muted">Not activated</span>';
+  const days = Math.max(0, Math.ceil((t.expiresAt - Date.now()) / 86400000));
+  return new Date(t.expiresAt).toLocaleDateString() + ' <span class="muted small">(' + days + 'd left)</span>';
+}
+
+function renderTokens() {
+  const tbody = document.getElementById('tokens-body');
+  if (state.tokens.length === 0) {
+    tbody.innerHTML = '<tr class="empty-row"><td colspan="7">You have not generated any tokens yet.</td></tr>';
+    return;
+  }
+
+  tbody.innerHTML = state.tokens.map(function (t) {
+    const canRevoke = t.status === 'active' || t.status === 'available';
+    return '<tr>' +
+      '<td><span class="token-box">' + esc(t.token) + '</span></td>' +
+      '<td><span class="device-box">' + esc(t.deviceId) + '</span></td>' +
+      '<td>' + t.periodDays + ' Days</td>' +
+      '<td><span class="status-tag status-' + esc(t.status) + '">' + esc(t.status) + '</span></td>' +
+      '<td>' + expiryText(t) + '</td>' +
+      '<td class="muted">' + (t.note ? esc(t.note) : '-') + '</td>' +
+      '<td><div class="btn-row">' +
+        '<button class="btn-ghost btn-small" onclick="copyToken(\'' + t.token + '\')">Copy</button>' +
+        (canRevoke ? '<button class="btn-danger btn-small" onclick="revokeToken(\'' + t.token + '\')">Revoke</button>' : '') +
+      '</div></td>' +
+    '</tr>';
+  }).join('');
+}
+
+async function copyToken(token) {
+  try {
+    await navigator.clipboard.writeText(token);
+    toast('Copied ' + token, 'success');
+  } catch (err) {
+    prompt('Copy token:', token);
+  }
+}
+
+async function revokeToken(token) {
+  if (!confirm('Revoke token ' + token + '? The device will be locked out immediately.')) return;
+  try {
+    await api('/api/tokens/revoke', { method: 'POST', body: JSON.stringify({ token: token }) });
+    toast('Token revoked', 'success');
+    await refresh();
+  } catch (err) {
+    toast(err.message, 'error');
+  }
+}
+
+document.getElementById('gen-form').addEventListener('submit', async function (event) {
+  event.preventDefault();
+  const deviceId = document.getElementById('device-id-input').value.trim();
+  const periodDays = document.getElementById('period-select').value;
+  const note = document.getElementById('note-input').value.trim();
+
+  if (!deviceId) {
+    toast('Please enter the target Device ID', 'error');
+    return;
+  }
+  if (!periodDays) {
+    toast('No quota available for any period', 'error');
+    return;
+  }
+
+  try {
+    const data = await api('/api/tokens/generate', {
+      method: 'POST',
+      body: JSON.stringify({ device_id: deviceId, period_days: periodDays, note: note })
+    });
+    document.getElementById('device-id-input').value = '';
+    document.getElementById('note-input').value = '';
+    toast('Token ' + data.token.token + ' created for ' + deviceId, 'success');
+    await refresh();
+  } catch (err) {
+    toast(err.message, 'error');
+  }
+});
+
+document.getElementById('password-form').addEventListener('submit', async function (event) {
+  event.preventDefault();
+  const currentPassword = document.getElementById('current-password').value;
+  const newPassword = document.getElementById('new-password').value;
+  const confirmPassword = document.getElementById('confirm-password').value;
+
+  if (newPassword.length < 8) {
+    toast('New password must be at least 8 characters', 'error');
+    return;
+  }
+  if (newPassword !== confirmPassword) {
+    toast('New passwords do not match', 'error');
+    return;
+  }
+
+  try {
+    await api('/api/auth/change-password', {
+      method: 'POST',
+      body: JSON.stringify({ current_password: currentPassword, new_password: newPassword })
+    });
+    document.getElementById('password-form').reset();
+    toast('Password updated', 'success');
+  } catch (err) {
+    toast(err.message, 'error');
+  }
+});
+
+document.getElementById('logout-btn').addEventListener('click', async function () {
+  try { await api('/api/auth/logout', { method: 'POST' }); } catch (err) { /* ignore */ }
+  window.location.href = '/login';
+});
+
+init().catch(function (err) {
+  console.error(err);
+  toast(err.message, 'error');
+});
+setInterval(function () { refresh().catch(function () {}); }, 15000);
+</script>
+</body>
+</html>

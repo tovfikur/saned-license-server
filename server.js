@@ -1,37 +1,31 @@
 const http = require('http');
+const fs = require('fs');
+const path = require('path');
 const crypto = require('crypto');
-const { createClient } = require('@libsql/client');
+
+const { db, initDB, PERIODS } = require('./lib/db');
+const { hashPassword, verifyPassword } = require('./lib/security');
+const {
+    createSession,
+    destroySession,
+    deleteUserSessions,
+    getSessionUser,
+    setSessionCookie,
+    clearSessionCookie
+} = require('./lib/auth');
+const { readJsonBody, sendJson, sendHtml, redirect, getClientIp } = require('./lib/http');
 
 const PORT = process.env.PORT || 8888;
-const TURSO_URL = process.env.TURSO_DATABASE_URL || "libsql://saned-license-db-tovfikur.aws-ap-northeast-1.turso.io";
-const TURSO_TOKEN = process.env.TURSO_AUTH_TOKEN || "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhIjoicnciLCJpYXQiOjE3OTMwNDEwMzAsImlkIjoiMDFhMTc5OTItYmYwMS03YzViLWExZmYtMTU2NDFkNTgwMjhjIiwia2lkIjoiUUJzcEpWZzYydEZnb1VoTXItUEtMaVVrWWhlSnhOa2FUNkdrR3pSRkNzVSIsInJpZCI6ImExMzk1ODk1LTlkYWItNGRmYS04ZjczLWRhYTk2MDk0NzcyNCJ9.gUcFOe7BIbE7SMXVtG7vUB7pAu9E_PkXwS1ri_S78ot1vBd3U9OZNSqk2Q7cQh9OGLMLuV4XaPmADjzFassBDA";
-
-const db = createClient({
-    url: TURSO_URL,
-    authToken: TURSO_TOKEN
-});
-
-async function initDB() {
-    try {
-        await db.execute(`CREATE TABLE IF NOT EXISTS tokens (
-            token TEXT PRIMARY KEY,
-            period_days INTEGER,
-            created_at INTEGER,
-            activated_at INTEGER,
-            expires_at INTEGER,
-            device_id TEXT NOT NULL,
-            note TEXT,
-            status TEXT
-        )`);
-        console.log('[Turso] Database schema verified with pre-set device_id requirement');
-    } catch (e) {
-        console.error('[Turso] Initialization error:', e.message);
-    }
-}
-
-initDB();
+const PUBLIC_DIR = path.join(__dirname, 'public');
 
 const CHARS = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
+const USERNAME_RE = /^[a-zA-Z0-9_.-]{3,32}$/;
+const LOGIN_WINDOW_MS = 15 * 60 * 1000;
+const LOGIN_MAX_FAILURES = 5;
+
+const pageCache = new Map();
+const loginAttempts = new Map();
+
 function generate8CharToken() {
     let token = '';
     const bytes = crypto.randomBytes(8);
@@ -41,55 +35,125 @@ function generate8CharToken() {
     return token;
 }
 
-const server = http.createServer(async (req, res) => {
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+async function createUniqueToken(executor) {
+    for (;;) {
+        const token = generate8CharToken();
+        const check = await executor.execute({ sql: 'SELECT token FROM tokens WHERE token = ?', args: [token] });
+        if (check.rows.length === 0) return token;
+    }
+}
 
-    if (req.method === 'OPTIONS') {
+function loadPage(name) {
+    if (!pageCache.has(name)) {
+        pageCache.set(name, fs.readFileSync(path.join(PUBLIC_DIR, name), 'utf8'));
+    }
+    return pageCache.get(name);
+}
+
+function sendPage(res, name) {
+    try {
+        sendHtml(res, 200, loadPage(name));
+    } catch (err) {
+        console.error('[UI] Failed to load page:', name, err.message);
+        sendHtml(res, 500, '<h1>UI unavailable</h1>');
+    }
+}
+
+function checkLoginLimit(ip) {
+    const entry = loginAttempts.get(ip);
+    if (!entry) return { allowed: true };
+    if (entry.resetAt < Date.now()) {
+        loginAttempts.delete(ip);
+        return { allowed: true };
+    }
+    if (entry.count >= LOGIN_MAX_FAILURES) {
+        return { allowed: false, retryAfter: Math.ceil((entry.resetAt - Date.now()) / 1000) };
+    }
+    return { allowed: true };
+}
+
+function recordLoginFailure(ip) {
+    const now = Date.now();
+    const entry = loginAttempts.get(ip);
+    if (!entry || entry.resetAt < now) {
+        loginAttempts.set(ip, { count: 1, resetAt: now + LOGIN_WINDOW_MS });
+        return;
+    }
+    entry.count += 1;
+}
+
+function formatToken(row, now) {
+    let status = row.status;
+    if (status === 'active' && row.expires_at && now > Number(row.expires_at)) {
+        status = 'expired';
+    }
+    return {
+        token: String(row.token),
+        periodDays: Number(row.period_days),
+        createdAt: Number(row.created_at),
+        activatedAt: row.activated_at ? Number(row.activated_at) : null,
+        expiresAt: row.expires_at ? Number(row.expires_at) : null,
+        deviceId: String(row.device_id || ''),
+        note: row.note || '',
+        status: status,
+        resellerId: row.reseller_id ? String(row.reseller_id) : null,
+        ownerName: row.reseller_username ? String(row.reseller_username) : 'Master'
+    };
+}
+
+async function requireMaster(req, res) {
+    const user = await getSessionUser(req);
+    if (!user) {
+        sendJson(res, 401, { success: false, message: 'Authentication required' });
+        return null;
+    }
+    if (user.role !== 'master') {
+        sendJson(res, 403, { success: false, message: 'Master access required' });
+        return null;
+    }
+    return user;
+}
+
+function quotaList(rows) {
+    const map = new Map();
+    rows.forEach(row => map.set(Number(row.period_days), {
+        periodDays: Number(row.period_days),
+        maxTokens: Number(row.max_tokens),
+        usedCount: Number(row.used_count)
+    }));
+    return PERIODS.map(period => map.get(period) || { periodDays: period, maxTokens: 0, usedCount: 0 });
+}
+
+async function handleRequest(req, res) {
+    const parsedUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+    const pathname = parsedUrl.pathname;
+    const method = req.method;
+
+    if (['/api/verify', '/api/activate', '/api/health'].includes(pathname)) {
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+        res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    }
+
+    if (method === 'OPTIONS') {
         res.writeHead(200);
         res.end();
         return;
     }
 
-    const parsedUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
-    const pathname = parsedUrl.pathname;
-
-    function readJsonBody() {
-        return new Promise((resolve, reject) => {
-            let body = '';
-            req.on('data', chunk => { body += chunk; });
-            req.on('end', () => {
-                try {
-                    const data = body ? JSON.parse(body) : {};
-                    resolve(data);
-                } catch (err) {
-                    reject(err);
-                }
-            });
-        });
+    if (pathname === '/api/health' && method === 'GET') {
+        return sendJson(res, 200, { status: 'ok', time: Date.now(), database: 'turso-libsql' });
     }
 
-    function sendJson(statusCode, data) {
-        res.writeHead(statusCode, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(data));
-    }
-
-    // Health check
-    if (pathname === '/api/health' && req.method === 'GET') {
-        return sendJson(200, { status: 'ok', time: Date.now(), database: 'turso-libsql' });
-    }
-
-    // API: Verify token for device at startup
-    // Request: { "token": "XXXXXXXX", "device_id": "..." }
-    if (pathname === '/api/verify' && req.method === 'POST') {
+    // ---------------------------------------------------------------- Client API
+    if (pathname === '/api/verify' && method === 'POST') {
         try {
-            const body = await readJsonBody();
+            const body = await readJsonBody(req);
             const tokenStr = String(body.token || '').trim().toUpperCase();
             const deviceId = String(body.device_id || '').trim().toLowerCase();
 
             if (!tokenStr || !deviceId) {
-                return sendJson(400, { unlocked: false, message: 'Missing token or device_id' });
+                return sendJson(res, 400, { unlocked: false, message: 'Missing token or device_id' });
             }
 
             const result = await db.execute({
@@ -98,15 +162,14 @@ const server = http.createServer(async (req, res) => {
             });
 
             if (result.rows.length === 0) {
-                return sendJson(404, { unlocked: false, reason: 'not_found', message: 'Invalid token. Token not found.' });
+                return sendJson(res, 404, { unlocked: false, reason: 'not_found', message: 'Invalid token. Token not found.' });
             }
 
             const found = result.rows[0];
             const preSetDevice = String(found.device_id || '').trim().toLowerCase();
 
-            // Strict Device ID check
             if (preSetDevice !== deviceId) {
-                return sendJson(403, {
+                return sendJson(res, 403, {
                     unlocked: false,
                     reason: 'device_mismatch',
                     message: `Device mismatch! This token was generated for device ${preSetDevice}`
@@ -114,7 +177,7 @@ const server = http.createServer(async (req, res) => {
             }
 
             if (found.status === 'revoked') {
-                return sendJson(403, { unlocked: false, reason: 'revoked', message: 'Token has been revoked by admin' });
+                return sendJson(res, 403, { unlocked: false, reason: 'revoked', message: 'Token has been revoked by admin' });
             }
 
             const now = Date.now();
@@ -123,7 +186,7 @@ const server = http.createServer(async (req, res) => {
                     sql: 'UPDATE tokens SET status = ? WHERE token = ?',
                     args: ['expired', tokenStr]
                 });
-                return sendJson(403, {
+                return sendJson(res, 403, {
                     unlocked: false,
                     reason: 'expired',
                     expires_at: found.expires_at,
@@ -132,7 +195,7 @@ const server = http.createServer(async (req, res) => {
             }
 
             const daysLeft = found.expires_at ? Math.max(0, Math.ceil((Number(found.expires_at) - now) / (1000 * 60 * 60 * 24))) : Number(found.period_days);
-            return sendJson(200, {
+            return sendJson(res, 200, {
                 unlocked: true,
                 token: found.token,
                 expires_at: found.expires_at,
@@ -141,20 +204,18 @@ const server = http.createServer(async (req, res) => {
                 message: 'Active license verified'
             });
         } catch (err) {
-            return sendJson(500, { unlocked: false, message: 'Server error: ' + err.message });
+            return sendJson(res, 500, { unlocked: false, message: 'Server error: ' + err.message });
         }
     }
 
-    // API: Activate token on device
-    // Request: { "token": "XXXXXXXX", "device_id": "..." }
-    if (pathname === '/api/activate' && req.method === 'POST') {
+    if (pathname === '/api/activate' && method === 'POST') {
         try {
-            const body = await readJsonBody();
+            const body = await readJsonBody(req);
             const tokenStr = String(body.token || '').trim().toUpperCase();
             const deviceId = String(body.device_id || '').trim().toLowerCase();
 
             if (!tokenStr || !deviceId) {
-                return sendJson(400, { success: false, unlocked: false, message: 'Missing token or device_id' });
+                return sendJson(res, 400, { success: false, unlocked: false, message: 'Missing token or device_id' });
             }
 
             const result = await db.execute({
@@ -163,15 +224,14 @@ const server = http.createServer(async (req, res) => {
             });
 
             if (result.rows.length === 0) {
-                return sendJson(404, { success: false, unlocked: false, message: 'Invalid 8-character token. Token does not exist.' });
+                return sendJson(res, 404, { success: false, unlocked: false, message: 'Invalid 8-character token. Token does not exist.' });
             }
 
             const found = result.rows[0];
             const preSetDevice = String(found.device_id || '').trim().toLowerCase();
 
-            // STRICT DEVICE ID MATCH: The token MUST belong to this pre-set device ID!
             if (preSetDevice !== deviceId) {
-                return sendJson(403, {
+                return sendJson(res, 403, {
                     success: false,
                     unlocked: false,
                     message: `Wrong device! This token was issued for device ID: ${preSetDevice}`
@@ -179,13 +239,12 @@ const server = http.createServer(async (req, res) => {
             }
 
             if (found.status === 'revoked') {
-                return sendJson(403, { success: false, unlocked: false, message: 'This token has been revoked by admin' });
+                return sendJson(res, 403, { success: false, unlocked: false, message: 'This token has been revoked by admin' });
             }
 
             const now = Date.now();
             let expiresAt = found.expires_at;
 
-            // First activation: compute expiration from now + period_days
             if (!found.activated_at) {
                 expiresAt = now + (Number(found.period_days) * 24 * 60 * 60 * 1000);
                 await db.execute({
@@ -197,11 +256,11 @@ const server = http.createServer(async (req, res) => {
                     sql: 'UPDATE tokens SET status = ? WHERE token = ?',
                     args: ['expired', tokenStr]
                 });
-                return sendJson(403, { success: false, unlocked: false, message: 'This token has already expired' });
+                return sendJson(res, 403, { success: false, unlocked: false, message: 'This token has already expired' });
             }
 
             const daysLeft = Math.max(0, Math.ceil((Number(expiresAt) - now) / (1000 * 60 * 60 * 24)));
-            return sendJson(200, {
+            return sendJson(res, 200, {
                 success: true,
                 unlocked: true,
                 token: found.token,
@@ -211,384 +270,660 @@ const server = http.createServer(async (req, res) => {
                 message: 'Device verified and unlocked!'
             });
         } catch (err) {
-            return sendJson(500, { success: false, unlocked: false, message: 'Server error: ' + err.message });
+            return sendJson(res, 500, { success: false, unlocked: false, message: 'Server error: ' + err.message });
         }
     }
 
-    // API: List tokens (Admin)
-    if (pathname === '/api/tokens' && req.method === 'GET') {
+    // ------------------------------------------------------------------- Auth API
+    if (pathname === '/api/auth/login' && method === 'POST') {
+        const ip = getClientIp(req);
+        const limit = checkLoginLimit(ip);
+        if (!limit.allowed) {
+            return sendJson(res, 429, { success: false, message: `Too many attempts. Try again in ${limit.retryAfter}s.` });
+        }
+
+        let body;
         try {
-            const result = await db.execute('SELECT * FROM tokens ORDER BY created_at DESC');
-            const now = Date.now();
-            const formatted = result.rows.map(row => {
-                let status = row.status;
-                if (status === 'active' && row.expires_at && now > row.expires_at) {
-                    status = 'expired';
-                }
-                return {
-                    token: row.token,
-                    periodDays: Number(row.period_days),
-                    createdAt: Number(row.created_at),
-                    activatedAt: row.activated_at ? Number(row.activated_at) : null,
-                    expiresAt: row.expires_at ? Number(row.expires_at) : null,
-                    deviceId: row.device_id,
-                    note: row.note,
-                    status: status
-                };
-            });
-            return sendJson(200, { tokens: formatted });
+            body = await readJsonBody(req);
         } catch (err) {
-            return sendJson(500, { error: err.message });
+            return sendJson(res, 400, { success: false, message: err.message });
         }
+
+        const username = String(body.username || '').trim();
+        const password = String(body.password || '');
+
+        if (!username || !password) {
+            return sendJson(res, 400, { success: false, message: 'Username and password are required' });
+        }
+
+        const result = await db.execute({ sql: 'SELECT * FROM users WHERE username = ?', args: [username] });
+        const user = result.rows[0];
+
+        if (!user || !verifyPassword(password, user.password_hash)) {
+            recordLoginFailure(ip);
+            return sendJson(res, 401, { success: false, message: 'Invalid username or password' });
+        }
+
+        if (user.status !== 'active') {
+            return sendJson(res, 403, { success: false, message: 'This account has been disabled' });
+        }
+
+        loginAttempts.delete(ip);
+        const session = await createSession(String(user.id));
+        setSessionCookie(res, session.token, session.expiresAt);
+
+        return sendJson(res, 200, {
+            success: true,
+            user: { id: String(user.id), username: String(user.username), role: String(user.role) }
+        });
     }
 
-    // API: Generate new token with PRE-SET Device ID (Admin)
-    if (pathname === '/api/tokens/generate' && req.method === 'POST') {
+    if (pathname === '/api/auth/logout' && method === 'POST') {
+        const user = await getSessionUser(req);
+        if (user) await destroySession(user.sessionToken);
+        clearSessionCookie(res);
+        return sendJson(res, 200, { success: true });
+    }
+
+    if (pathname === '/api/auth/me' && method === 'GET') {
+        const user = await getSessionUser(req);
+        if (!user) return sendJson(res, 200, { user: null });
+        return sendJson(res, 200, { user: { id: user.id, username: user.username, role: user.role } });
+    }
+
+    if (pathname === '/api/auth/change-password' && method === 'POST') {
+        const user = await getSessionUser(req);
+        if (!user) return sendJson(res, 401, { success: false, message: 'Authentication required' });
+
+        let body;
         try {
-            const body = await readJsonBody();
-            const deviceId = String(body.device_id || '').trim().toLowerCase();
-            const periodDays = parseInt(body.period_days, 10) || 30;
-            const note = body.note ? String(body.note).trim() : '';
+            body = await readJsonBody(req);
+        } catch (err) {
+            return sendJson(res, 400, { success: false, message: err.message });
+        }
 
-            if (!deviceId) {
-                return sendJson(400, {
-                    success: false,
-                    message: 'Target Device ID is required. Every token must be pre-set for a device.'
-                });
+        const currentPassword = String(body.current_password || '');
+        const newPassword = String(body.new_password || '');
+
+        if (newPassword.length < 8) {
+            return sendJson(res, 400, { success: false, message: 'New password must be at least 8 characters' });
+        }
+
+        const result = await db.execute({ sql: 'SELECT password_hash FROM users WHERE id = ?', args: [user.id] });
+        if (result.rows.length === 0 || !verifyPassword(currentPassword, result.rows[0].password_hash)) {
+            return sendJson(res, 400, { success: false, message: 'Current password is incorrect' });
+        }
+
+        await db.execute({
+            sql: 'UPDATE users SET password_hash = ? WHERE id = ?',
+            args: [hashPassword(newPassword), user.id]
+        });
+        await deleteUserSessions(user.id, user.sessionToken);
+
+        return sendJson(res, 200, { success: true, message: 'Password updated' });
+    }
+
+    // ------------------------------------------------------------------- Tokens API
+    if (pathname === '/api/tokens' && method === 'GET') {
+        const user = await getSessionUser(req);
+        if (!user) return sendJson(res, 401, { success: false, message: 'Authentication required' });
+
+        const where = [];
+        const args = [];
+
+        if (user.role === 'reseller') {
+            where.push('t.reseller_id = ?');
+            args.push(user.id);
+        } else {
+            const resellerFilter = parsedUrl.searchParams.get('reseller_id');
+            if (resellerFilter === 'master') {
+                where.push('t.reseller_id IS NULL');
+            } else if (resellerFilter) {
+                where.push('t.reseller_id = ?');
+                args.push(resellerFilter);
             }
+        }
 
-            let token = generate8CharToken();
-            let check = await db.execute({ sql: 'SELECT token FROM tokens WHERE token = ?', args: [token] });
-            while (check.rows.length > 0) {
-                token = generate8CharToken();
-                check = await db.execute({ sql: 'SELECT token FROM tokens WHERE token = ?', args: [token] });
+        const sql = `SELECT t.*, u.username AS reseller_username
+                     FROM tokens t LEFT JOIN users u ON u.id = t.reseller_id
+                     ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+                     ORDER BY t.created_at DESC`;
+
+        const result = await db.execute({ sql, args });
+        const now = Date.now();
+        let tokens = result.rows.map(row => formatToken(row, now));
+
+        const statusFilter = parsedUrl.searchParams.get('status');
+        if (statusFilter) tokens = tokens.filter(t => t.status === statusFilter);
+
+        return sendJson(res, 200, { tokens });
+    }
+
+    if (pathname === '/api/tokens/generate' && method === 'POST') {
+        const user = await getSessionUser(req);
+        if (!user) return sendJson(res, 401, { success: false, message: 'Authentication required' });
+
+        let body;
+        try {
+            body = await readJsonBody(req);
+        } catch (err) {
+            return sendJson(res, 400, { success: false, message: err.message });
+        }
+
+        const deviceId = String(body.device_id || '').trim().toLowerCase();
+        const periodDays = parseInt(body.period_days, 10);
+        const note = body.note ? String(body.note).trim().slice(0, 200) : '';
+
+        if (!deviceId) {
+            return sendJson(res, 400, { success: false, message: 'Target Device ID is required. Every token must be pre-set for a device.' });
+        }
+        if (!PERIODS.includes(periodDays)) {
+            return sendJson(res, 400, { success: false, message: 'Invalid subscription period' });
+        }
+
+        let ownerId = null;
+        if (user.role === 'reseller') {
+            ownerId = user.id;
+        } else if (body.reseller_id) {
+            ownerId = String(body.reseller_id);
+        }
+
+        if (ownerId) {
+            const owner = await db.execute({
+                sql: "SELECT id, username, status FROM users WHERE id = ? AND role = 'reseller'",
+                args: [ownerId]
+            });
+            if (owner.rows.length === 0) {
+                return sendJson(res, 400, { success: false, message: 'Invalid reseller selected' });
             }
+            if (owner.rows[0].status !== 'active') {
+                return sendJson(res, 400, { success: false, message: 'Selected reseller is disabled' });
+            }
+        }
 
-            const now = Date.now();
+        const now = Date.now();
+
+        if (!ownerId) {
+            const token = await createUniqueToken(db);
             await db.execute({
-                sql: `INSERT INTO tokens (token, period_days, created_at, activated_at, expires_at, device_id, note, status)
-                      VALUES (?, ?, ?, NULL, NULL, ?, ?, ?)`,
+                sql: `INSERT INTO tokens (token, period_days, created_at, activated_at, expires_at, device_id, note, status, reseller_id)
+                      VALUES (?, ?, ?, NULL, NULL, ?, ?, ?, NULL)`,
                 args: [token, periodDays, now, deviceId, note, 'available']
             });
-
-            return sendJson(201, {
+            return sendJson(res, 201, {
                 success: true,
                 token: {
-                    token: token,
-                    periodDays: periodDays,
+                    token,
+                    periodDays,
                     createdAt: now,
                     activatedAt: null,
                     expiresAt: null,
-                    deviceId: deviceId,
-                    note: note,
-                    status: 'available'
+                    deviceId,
+                    note,
+                    status: 'available',
+                    resellerId: null,
+                    ownerName: 'Master'
+                }
+            });
+        }
+
+        const tx = await db.transaction('write');
+        try {
+            const quota = await tx.execute({
+                sql: 'SELECT max_tokens, used_count FROM reseller_quotas WHERE user_id = ? AND period_days = ?',
+                args: [ownerId, periodDays]
+            });
+
+            if (quota.rows.length === 0 || Number(quota.rows[0].max_tokens) <= 0) {
+                await tx.rollback();
+                return sendJson(res, 403, { success: false, message: `This reseller is blocked from generating ${periodDays}-day tokens` });
+            }
+            if (Number(quota.rows[0].used_count) >= Number(quota.rows[0].max_tokens)) {
+                await tx.rollback();
+                return sendJson(res, 403, { success: false, message: `Quota reached for ${periodDays}-day tokens` });
+            }
+
+            const token = await createUniqueToken(tx);
+            await tx.execute({
+                sql: `INSERT INTO tokens (token, period_days, created_at, activated_at, expires_at, device_id, note, status, reseller_id)
+                      VALUES (?, ?, ?, NULL, NULL, ?, ?, ?, ?)`,
+                args: [token, periodDays, now, deviceId, note, 'available', ownerId]
+            });
+            await tx.execute({
+                sql: 'UPDATE reseller_quotas SET used_count = used_count + 1 WHERE user_id = ? AND period_days = ?',
+                args: [ownerId, periodDays]
+            });
+            await tx.commit();
+
+            return sendJson(res, 201, {
+                success: true,
+                token: {
+                    token,
+                    periodDays,
+                    createdAt: now,
+                    activatedAt: null,
+                    expiresAt: null,
+                    deviceId,
+                    note,
+                    status: 'available',
+                    resellerId: ownerId,
+                    ownerName: ''
                 }
             });
         } catch (err) {
-            return sendJson(500, { success: false, message: 'Server error: ' + err.message });
+            try { await tx.rollback(); } catch (e) { /* already closed */ }
+            throw err;
         }
     }
 
-    // API: Revoke token
-    if (pathname === '/api/tokens/revoke' && req.method === 'POST') {
+    if (pathname === '/api/tokens/revoke' && method === 'POST') {
+        const user = await getSessionUser(req);
+        if (!user) return sendJson(res, 401, { success: false, message: 'Authentication required' });
+
+        let body;
         try {
-            const body = await readJsonBody();
-            if (!body.token) return sendJson(400, { success: false, message: 'Missing token' });
-            await db.execute({
-                sql: 'UPDATE tokens SET status = ? WHERE token = ?',
-                args: ['revoked', String(body.token).trim().toUpperCase()]
-            });
-            return sendJson(200, { success: true, message: 'Token revoked' });
+            body = await readJsonBody(req);
         } catch (err) {
-            return sendJson(500, { success: false, message: err.message });
+            return sendJson(res, 400, { success: false, message: err.message });
         }
+
+        const tokenStr = String(body.token || '').trim().toUpperCase();
+        if (!tokenStr) return sendJson(res, 400, { success: false, message: 'Missing token' });
+
+        const result = await db.execute({ sql: 'SELECT token, reseller_id FROM tokens WHERE token = ?', args: [tokenStr] });
+        if (result.rows.length === 0) return sendJson(res, 404, { success: false, message: 'Token not found' });
+
+        if (user.role === 'reseller' && String(result.rows[0].reseller_id || '') !== user.id) {
+            return sendJson(res, 403, { success: false, message: 'You can only revoke your own tokens' });
+        }
+
+        await db.execute({
+            sql: 'UPDATE tokens SET status = ? WHERE token = ?',
+            args: ['revoked', tokenStr]
+        });
+        return sendJson(res, 200, { success: true, message: 'Token revoked' });
     }
 
-    // API: Delete token
-    if (pathname === '/api/tokens/delete' && req.method === 'POST') {
+    if (pathname === '/api/tokens/delete' && method === 'POST') {
+        const user = await getSessionUser(req);
+        if (!user) return sendJson(res, 401, { success: false, message: 'Authentication required' });
+        if (user.role !== 'master') {
+            return sendJson(res, 403, { success: false, message: 'Only the master account can delete tokens' });
+        }
+
+        let body;
         try {
-            const body = await readJsonBody();
-            if (!body.token) return sendJson(400, { success: false, message: 'Missing token' });
-            await db.execute({
-                sql: 'DELETE FROM tokens WHERE token = ?',
-                args: [String(body.token).trim().toUpperCase()]
-            });
-            return sendJson(200, { success: true, message: 'Token deleted' });
+            body = await readJsonBody(req);
         } catch (err) {
-            return sendJson(500, { success: false, message: err.message });
+            return sendJson(res, 400, { success: false, message: err.message });
         }
+
+        if (!body.token) return sendJson(res, 400, { success: false, message: 'Missing token' });
+        await db.execute({
+            sql: 'DELETE FROM tokens WHERE token = ?',
+            args: [String(body.token).trim().toUpperCase()]
+        });
+        return sendJson(res, 200, { success: true, message: 'Token deleted' });
     }
 
-    // Web Dashboard (GET /)
-    if (pathname === '/' && req.method === 'GET') {
-        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-        res.end(getDashboardHtml());
+    // ---------------------------------------------------------------- Reseller API
+    if (pathname === '/api/me/quotas' && method === 'GET') {
+        const user = await getSessionUser(req);
+        if (!user) return sendJson(res, 401, { success: false, message: 'Authentication required' });
+        if (user.role !== 'reseller') return sendJson(res, 200, { quotas: [] });
+
+        const result = await db.execute({
+            sql: 'SELECT period_days, max_tokens, used_count FROM reseller_quotas WHERE user_id = ? ORDER BY period_days ASC',
+            args: [user.id]
+        });
+        const quotas = quotaList(result.rows).map(q => ({
+            ...q,
+            remaining: Math.max(0, q.maxTokens - q.usedCount)
+        }));
+        return sendJson(res, 200, { quotas });
+    }
+
+    // ------------------------------------------------------------------ Admin API
+    if (pathname === '/api/admin/stats' && method === 'GET') {
+        if (!(await requireMaster(req, res))) return;
+
+        const tokens = await db.execute('SELECT status, expires_at FROM tokens');
+        const now = Date.now();
+        const stats = { total: 0, active: 0, available: 0, expired: 0, revoked: 0 };
+        tokens.rows.forEach(row => {
+            let status = row.status;
+            if (status === 'active' && row.expires_at && now > Number(row.expires_at)) status = 'expired';
+            stats.total += 1;
+            if (stats[status] !== undefined) stats[status] += 1;
+        });
+
+        const resellers = await db.execute("SELECT status, COUNT(*) AS c FROM users WHERE role = 'reseller' GROUP BY status");
+        stats.resellers = 0;
+        stats.resellersDisabled = 0;
+        resellers.rows.forEach(row => {
+            stats.resellers += Number(row.c);
+            if (row.status === 'disabled') stats.resellersDisabled += Number(row.c);
+        });
+
+        return sendJson(res, 200, stats);
+    }
+
+    if (pathname === '/api/admin/resellers' && method === 'GET') {
+        if (!(await requireMaster(req, res))) return;
+
+        const users = await db.execute("SELECT id, username, status, created_at FROM users WHERE role = 'reseller' ORDER BY created_at DESC");
+        const quotas = await db.execute('SELECT user_id, period_days, max_tokens, used_count FROM reseller_quotas');
+        const counts = await db.execute("SELECT reseller_id, COUNT(*) AS c FROM tokens WHERE reseller_id IS NOT NULL GROUP BY reseller_id");
+
+        const quotaMap = new Map();
+        quotas.rows.forEach(row => {
+            const key = String(row.user_id);
+            if (!quotaMap.has(key)) quotaMap.set(key, []);
+            quotaMap.get(key).push(row);
+        });
+        const countMap = new Map();
+        counts.rows.forEach(row => countMap.set(String(row.reseller_id), Number(row.c)));
+
+        const resellers = users.rows.map(row => {
+            const id = String(row.id);
+            const list = quotaList(quotaMap.get(id) || []);
+            return {
+                id,
+                username: String(row.username),
+                status: String(row.status),
+                createdAt: Number(row.created_at),
+                tokenCount: countMap.get(id) || 0,
+                quotas: list.map(q => ({ ...q, remaining: Math.max(0, q.maxTokens - q.usedCount) }))
+            };
+        });
+
+        return sendJson(res, 200, { resellers });
+    }
+
+    if (pathname === '/api/admin/resellers' && method === 'POST') {
+        if (!(await requireMaster(req, res))) return;
+
+        let body;
+        try {
+            body = await readJsonBody(req);
+        } catch (err) {
+            return sendJson(res, 400, { success: false, message: err.message });
+        }
+
+        const username = String(body.username || '').trim();
+        const password = String(body.password || '');
+
+        if (!USERNAME_RE.test(username)) {
+            return sendJson(res, 400, { success: false, message: 'Username must be 3-32 characters (letters, numbers, . _ -)' });
+        }
+        if (password.length < 8) {
+            return sendJson(res, 400, { success: false, message: 'Password must be at least 8 characters' });
+        }
+
+        const existing = await db.execute({ sql: 'SELECT id FROM users WHERE username = ?', args: [username] });
+        if (existing.rows.length > 0) {
+            return sendJson(res, 409, { success: false, message: 'Username already exists' });
+        }
+
+        const id = crypto.randomBytes(16).toString('hex');
+        const now = Date.now();
+
+        await db.execute({
+            sql: 'INSERT INTO users (id, username, password_hash, role, status, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+            args: [id, username, hashPassword(password), 'reseller', 'active', now]
+        });
+
+        for (const period of PERIODS) {
+            await db.execute({
+                sql: 'INSERT INTO reseller_quotas (user_id, period_days, max_tokens, used_count) VALUES (?, ?, 0, 0)',
+                args: [id, period]
+            });
+        }
+
+        return sendJson(res, 201, {
+            success: true,
+            reseller: { id, username, status: 'active', createdAt: now, tokenCount: 0, quotas: quotaList([]) }
+        });
+    }
+
+    if (pathname === '/api/admin/resellers/update' && method === 'POST') {
+        if (!(await requireMaster(req, res))) return;
+
+        let body;
+        try {
+            body = await readJsonBody(req);
+        } catch (err) {
+            return sendJson(res, 400, { success: false, message: err.message });
+        }
+
+        const userId = String(body.user_id || '');
+        if (!userId) return sendJson(res, 400, { success: false, message: 'Missing user_id' });
+
+        const target = await db.execute({ sql: "SELECT id, username, status FROM users WHERE id = ? AND role = 'reseller'", args: [userId] });
+        if (target.rows.length === 0) return sendJson(res, 404, { success: false, message: 'Reseller not found' });
+
+        if (body.username !== undefined) {
+            const username = String(body.username || '').trim();
+            if (!USERNAME_RE.test(username)) {
+                return sendJson(res, 400, { success: false, message: 'Username must be 3-32 characters (letters, numbers, . _ -)' });
+            }
+            const existing = await db.execute({ sql: 'SELECT id FROM users WHERE username = ? AND id != ?', args: [username, userId] });
+            if (existing.rows.length > 0) {
+                return sendJson(res, 409, { success: false, message: 'Username already exists' });
+            }
+            await db.execute({ sql: 'UPDATE users SET username = ? WHERE id = ?', args: [username, userId] });
+        }
+
+        if (body.password !== undefined) {
+            const password = String(body.password || '');
+            if (password.length < 8) {
+                return sendJson(res, 400, { success: false, message: 'Password must be at least 8 characters' });
+            }
+            await db.execute({ sql: 'UPDATE users SET password_hash = ? WHERE id = ?', args: [hashPassword(password), userId] });
+            await deleteUserSessions(userId);
+        }
+
+        if (body.status !== undefined) {
+            const status = String(body.status || '');
+            if (!['active', 'disabled'].includes(status)) {
+                return sendJson(res, 400, { success: false, message: 'Invalid status' });
+            }
+            await db.execute({ sql: 'UPDATE users SET status = ? WHERE id = ?', args: [status, userId] });
+            if (status === 'disabled') await deleteUserSessions(userId);
+        }
+
+        return sendJson(res, 200, { success: true });
+    }
+
+    if (pathname === '/api/admin/resellers/delete' && method === 'POST') {
+        if (!(await requireMaster(req, res))) return;
+
+        let body;
+        try {
+            body = await readJsonBody(req);
+        } catch (err) {
+            return sendJson(res, 400, { success: false, message: err.message });
+        }
+
+        const userId = String(body.user_id || '');
+        if (!userId) return sendJson(res, 400, { success: false, message: 'Missing user_id' });
+
+        const target = await db.execute({ sql: "SELECT id FROM users WHERE id = ? AND role = 'reseller'", args: [userId] });
+        if (target.rows.length === 0) return sendJson(res, 404, { success: false, message: 'Reseller not found' });
+
+        const tx = await db.transaction('write');
+        try {
+            await tx.execute({ sql: 'UPDATE tokens SET reseller_id = NULL WHERE reseller_id = ?', args: [userId] });
+            await tx.execute({ sql: 'DELETE FROM sessions WHERE user_id = ?', args: [userId] });
+            await tx.execute({ sql: 'DELETE FROM reseller_quotas WHERE user_id = ?', args: [userId] });
+            await tx.execute({ sql: "DELETE FROM users WHERE id = ? AND role = 'reseller'", args: [userId] });
+            await tx.commit();
+        } catch (err) {
+            try { await tx.rollback(); } catch (e) { /* already closed */ }
+            throw err;
+        }
+
+        return sendJson(res, 200, { success: true, message: 'Reseller deleted. Their tokens are now owned by master.' });
+    }
+
+    if (pathname === '/api/admin/resellers/quotas' && method === 'POST') {
+        if (!(await requireMaster(req, res))) return;
+
+        let body;
+        try {
+            body = await readJsonBody(req);
+        } catch (err) {
+            return sendJson(res, 400, { success: false, message: err.message });
+        }
+
+        const userId = String(body.user_id || '');
+        if (!userId) return sendJson(res, 400, { success: false, message: 'Missing user_id' });
+
+        const target = await db.execute({ sql: "SELECT id FROM users WHERE id = ? AND role = 'reseller'", args: [userId] });
+        if (target.rows.length === 0) return sendJson(res, 404, { success: false, message: 'Reseller not found' });
+
+        const input = body.quotas || {};
+        const tx = await db.transaction('write');
+        try {
+            for (const period of PERIODS) {
+                let raw;
+                if (Array.isArray(input)) {
+                    const found = input.find(q => Number(q.period_days) === period);
+                    raw = found ? found.max_tokens : 0;
+                } else {
+                    raw = input[String(period)];
+                }
+                const maxTokens = Math.max(0, parseInt(raw, 10) || 0);
+                await tx.execute({
+                    sql: `INSERT INTO reseller_quotas (user_id, period_days, max_tokens, used_count)
+                          VALUES (?, ?, ?, 0)
+                          ON CONFLICT(user_id, period_days) DO UPDATE SET max_tokens = excluded.max_tokens`,
+                    args: [userId, period, maxTokens]
+                });
+            }
+            await tx.commit();
+        } catch (err) {
+            try { await tx.rollback(); } catch (e) { /* already closed */ }
+            throw err;
+        }
+
+        return sendJson(res, 200, { success: true, message: 'Quotas updated' });
+    }
+
+    if (pathname === '/api/admin/resellers/reset-usage' && method === 'POST') {
+        if (!(await requireMaster(req, res))) return;
+
+        let body;
+        try {
+            body = await readJsonBody(req);
+        } catch (err) {
+            return sendJson(res, 400, { success: false, message: err.message });
+        }
+
+        const userId = String(body.user_id || '');
+        if (!userId) return sendJson(res, 400, { success: false, message: 'Missing user_id' });
+
+        const target = await db.execute({ sql: "SELECT id FROM users WHERE id = ? AND role = 'reseller'", args: [userId] });
+        if (target.rows.length === 0) return sendJson(res, 404, { success: false, message: 'Reseller not found' });
+
+        if (body.period_days !== undefined) {
+            const period = parseInt(body.period_days, 10);
+            if (!PERIODS.includes(period)) return sendJson(res, 400, { success: false, message: 'Invalid period' });
+            await db.execute({
+                sql: 'UPDATE reseller_quotas SET used_count = 0 WHERE user_id = ? AND period_days = ?',
+                args: [userId, period]
+            });
+        } else {
+            await db.execute({ sql: 'UPDATE reseller_quotas SET used_count = 0 WHERE user_id = ?', args: [userId] });
+        }
+
+        return sendJson(res, 200, { success: true, message: 'Usage reset' });
+    }
+
+    // --------------------------------------------------------------------- Pages
+    if (pathname === '/styles.css' && method === 'GET') {
+        try {
+            const css = fs.readFileSync(path.join(PUBLIC_DIR, 'styles.css'), 'utf8');
+            res.writeHead(200, { 'Content-Type': 'text/css; charset=utf-8' });
+            res.end(css);
+        } catch (err) {
+            sendHtml(res, 404, 'Not found');
+        }
         return;
     }
 
-    sendJson(404, { message: 'Not Found' });
+    if (pathname === '/favicon.ico' && method === 'GET') {
+        res.writeHead(204);
+        res.end();
+        return;
+    }
+
+    if (pathname === '/' && method === 'GET') {
+        const user = await getSessionUser(req);
+        if (!user) return redirect(res, '/login');
+        return redirect(res, user.role === 'master' ? '/master' : '/reseller');
+    }
+
+    if (pathname === '/login' && method === 'GET') {
+        const user = await getSessionUser(req);
+        if (user) return redirect(res, user.role === 'master' ? '/master' : '/reseller');
+        return sendPage(res, 'login.html');
+    }
+
+    if (pathname === '/master' && method === 'GET') {
+        const user = await getSessionUser(req);
+        if (!user) return redirect(res, '/login');
+        if (user.role !== 'master') return redirect(res, '/reseller');
+        return sendPage(res, 'master.html');
+    }
+
+    if (pathname === '/reseller' && method === 'GET') {
+        const user = await getSessionUser(req);
+        if (!user) return redirect(res, '/login');
+        if (user.role !== 'reseller') return redirect(res, '/master');
+        return sendPage(res, 'reseller.html');
+    }
+
+    sendJson(res, 404, { message: 'Not Found' });
+}
+
+const server = http.createServer((req, res) => {
+    handleRequest(req, res).catch(err => {
+        console.error('[Server] Unhandled error:', err);
+        if (!res.headersSent) {
+            sendJson(res, 500, { success: false, message: 'Server error' });
+        } else {
+            res.end();
+        }
+    });
 });
 
-function getDashboardHtml() {
-    return `<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Saned Assistant - License Admin Dashboard</title>
-<style>
-  :root {
-    --bg: #0f172a;
-    --card: #1e293b;
-    --border: #334155;
-    --accent: #3b82f6;
-    --accent-hover: #2563eb;
-    --text: #f8fafc;
-    --text-muted: #94a3b8;
-    --success: #10b981;
-    --warning: #f59e0b;
-    --danger: #ef4444;
-  }
-  * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
-  body { background: var(--bg); color: var(--text); padding: 2rem 1rem; }
-  .container { max-width: 1040px; margin: 0 auto; }
-  header { margin-bottom: 2rem; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 1rem; }
-  h1 { font-size: 1.8rem; font-weight: 700; color: #fff; display: flex; align-items: center; gap: 0.5rem; }
-  .badge-app { font-size: 0.75rem; background: var(--accent); color: white; padding: 0.2rem 0.6rem; border-radius: 9999px; }
-  .badge-turso { font-size: 0.75rem; background: #059669; color: white; padding: 0.2rem 0.6rem; border-radius: 9999px; }
-  .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 1.5rem; margin-bottom: 2rem; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.3); }
-  .card-title { font-size: 1.2rem; font-weight: 600; margin-bottom: 1rem; color: #e2e8f0; display: flex; align-items: center; gap: 0.5rem; }
-  .form-row { display: flex; gap: 1rem; flex-wrap: wrap; align-items: flex-end; }
-  .form-group { display: flex; flex-direction: column; gap: 0.4rem; flex: 1; min-width: 200px; }
-  label { font-size: 0.85rem; color: var(--text-muted); font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; }
-  select, input { background: #0f172a; border: 1px solid var(--border); color: #fff; padding: 0.65rem 0.9rem; border-radius: 8px; font-size: 0.95rem; outline: none; }
-  select:focus, input:focus { border-color: var(--accent); }
-  button { background: var(--accent); color: white; border: none; padding: 0.65rem 1.4rem; border-radius: 8px; font-weight: 600; cursor: pointer; transition: background 0.2s; font-size: 0.95rem; white-space: nowrap; }
-  button:hover { background: var(--accent-hover); }
-  .btn-danger { background: #b91c1c; }
-  .btn-danger:hover { background: var(--danger); }
-  .btn-small { padding: 0.35rem 0.7rem; font-size: 0.8rem; border-radius: 6px; }
-  .token-table { width: 100%; border-collapse: collapse; margin-top: 1rem; }
-  .token-table th, .token-table td { padding: 0.85rem 1rem; text-align: left; border-bottom: 1px solid var(--border); font-size: 0.9rem; }
-  .token-table th { color: var(--text-muted); font-weight: 600; background: #162032; font-size: 0.8rem; text-transform: uppercase; }
-  .token-box { font-family: monospace; font-size: 1.15rem; font-weight: 700; color: #38bdf8; letter-spacing: 0.1em; background: #0f172a; padding: 0.2rem 0.5rem; border-radius: 4px; display: inline-block; }
-  .device-box { font-family: monospace; font-size: 0.95rem; color: #a5f3fc; background: #0f172a; padding: 0.2rem 0.5rem; border-radius: 4px; display: inline-block; }
-  .status-tag { padding: 0.2rem 0.6rem; border-radius: 9999px; font-size: 0.75rem; font-weight: 600; text-transform: uppercase; display: inline-block; }
-  .status-available { background: rgba(59, 130, 246, 0.2); color: #60a5fa; border: 1px solid #3b82f6; }
-  .status-active { background: rgba(16, 185, 129, 0.2); color: #34d399; border: 1px solid #10b981; }
-  .status-expired { background: rgba(245, 158, 11, 0.2); color: #fbbf24; border: 1px solid #f59e0b; }
-  .status-revoked { background: rgba(239, 68, 68, 0.2); color: #f87171; border: 1px solid #ef4444; }
-  .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; margin-bottom: 2rem; }
-  .stat-card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 1.2rem; }
-  .stat-value { font-size: 2rem; font-weight: 700; margin-top: 0.3rem; }
-  .copy-btn { cursor: pointer; background: #334155; border: none; color: #cbd5e1; border-radius: 4px; padding: 0.2rem 0.5rem; font-size: 0.75rem; margin-left: 0.4rem; }
-  .copy-btn:hover { background: #475569; }
-</style>
-</head>
-<body>
-<div class="container">
-  <header>
-    <div>
-      <h1>Saned Assistant <span class="badge-app">License Manager</span> <span class="badge-turso">Turso Cloud</span></h1>
-      <p style="color: var(--text-muted); font-size: 0.9rem; margin-top: 0.2rem;">Pre-Set Device Verification & Subscription Control</p>
-    </div>
-    <div style="color: #34d399; font-size: 0.85rem;">● Turso Cloud DB Active</div>
-  </header>
+initDB().then(() => {
+    server.listen(PORT, '0.0.0.0', () => {
+        console.log(`[Verification Server] Running on port ${PORT}`);
 
-  <div class="stats-grid">
-    <div class="stat-card">
-      <div style="color: var(--text-muted); font-size: 0.85rem;">Total Licenses</div>
-      <div class="stat-value" id="stat-total" style="color: #60a5fa;">0</div>
-    </div>
-    <div class="stat-card">
-      <div style="color: var(--text-muted); font-size: 0.85rem;">Active Devices</div>
-      <div class="stat-value" id="stat-active" style="color: #34d399;">0</div>
-    </div>
-    <div class="stat-card">
-      <div style="color: var(--text-muted); font-size: 0.85rem;">Available Tokens</div>
-      <div class="stat-value" id="stat-available" style="color: #cbd5e1;">0</div>
-    </div>
-  </div>
+        const keepAliveUrl = process.env.RENDER_EXTERNAL_URL || 'https://saned-license-server.onrender.com';
+        setInterval(() => {
+            try {
+                const https = require('https');
+                https.get(`${keepAliveUrl}/api/health`, (res) => {
+                    console.log(`[Keep-Alive] Pinged ${keepAliveUrl}/api/health -> Status: ${res.statusCode}`);
+                }).on('error', (err) => {
+                    console.error('[Keep-Alive] Ping error:', err.message);
+                });
+            } catch (e) {
+                console.error('[Keep-Alive] Exception:', e.message);
+            }
+        }, 8 * 60 * 1000);
 
-  <div class="card">
-    <div class="card-title">🔑 Generate Token for Pre-Set Device</div>
-    <form id="gen-form" onsubmit="generateToken(event)">
-      <div class="form-row">
-        <div class="form-group" style="flex: 1.4;">
-          <label>Target Device ID (Required) *</label>
-          <input type="text" id="device-id-input" placeholder="e.g. cf4ade3f1edec2c7" required style="font-family: monospace;">
-        </div>
-        <div class="form-group" style="flex: 1;">
-          <label>Subscription Period</label>
-          <select id="period-select">
-            <option value="1">1 Day</option>
-            <option value="3">3 Days</option>
-            <option value="7">7 Days (1 Week)</option>
-            <option value="30" selected>30 Days (1 Month)</option>
-            <option value="60">60 Days (2 Months)</option>
-            <option value="90">90 Days (3 Months)</option>
-            <option value="365">365 Days (1 Year)</option>
-          </select>
-        </div>
-        <div class="form-group" style="flex: 1;">
-          <label>Customer Name / Note (Optional)</label>
-          <input type="text" id="note-input" placeholder="e.g. Driver Ahmed">
-        </div>
-        <div>
-          <button type="submit">+ Issue Token</button>
-        </div>
-      </div>
-    </form>
-  </div>
-
-  <div class="card">
-    <div class="card-title">📋 Issued Licenses & Pre-Set Devices</div>
-    <div style="overflow-x: auto;">
-      <table class="token-table">
-        <thead>
-          <tr>
-            <th>Token</th>
-            <th>Pre-Set Device ID</th>
-            <th>Duration</th>
-            <th>Status</th>
-            <th>Expires On</th>
-            <th>Customer Note</th>
-            <th>Actions</th>
-          </tr>
-        </thead>
-        <tbody id="tokens-body">
-          <tr><td colspan="7" style="text-align: center; color: var(--text-muted);">Loading tokens...</td></tr>
-        </tbody>
-      </table>
-    </div>
-  </div>
-</div>
-
-<script>
-async function fetchTokens() {
-  try {
-    const res = await fetch('/api/tokens');
-    const data = await res.json();
-    renderTokens(data.tokens || []);
-  } catch (e) {
-    console.error(e);
-  }
-}
-
-function renderTokens(tokens) {
-  const tbody = document.getElementById('tokens-body');
-  document.getElementById('stat-total').innerText = tokens.length;
-  document.getElementById('stat-active').innerText = tokens.filter(t => t.status === 'active').length;
-  document.getElementById('stat-available').innerText = tokens.filter(t => t.status === 'available').length;
-
-  if (tokens.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="7" style="text-align: center; color: var(--text-muted); padding: 2rem;">No tokens issued yet. Enter a Device ID and click "+ Issue Token" above.</td></tr>';
-    return;
-  }
-
-  tbody.innerHTML = tokens.map(t => {
-    let expiresStr = 'Not yet activated';
-    if (t.expiresAt) {
-      const expDate = new Date(t.expiresAt);
-      const daysLeft = Math.max(0, Math.ceil((t.expiresAt - Date.now()) / (1000 * 60 * 60 * 24)));
-      expiresStr = expDate.toLocaleDateString() + ' (' + daysLeft + 'd left)';
-    }
-
-    const deviceStr = '<span class="device-box">' + t.deviceId + '</span>';
-
-    return '<tr>' +
-      '<td><span class="token-box">' + t.token + '</span><button class="copy-btn" onclick="copyToken(\\'' + t.token + '\\')">Copy</button></td>' +
-      '<td>' + deviceStr + '</td>' +
-      '<td>' + t.periodDays + ' Days</td>' +
-      '<td><span class="status-tag status-' + t.status + '">' + t.status + '</span></td>' +
-      '<td>' + expiresStr + '</td>' +
-      '<td style="color: var(--text-muted);">' + (t.note || '-') + '</td>' +
-      '<td>' +
-        (t.status === 'active' ? '<button class="btn-danger btn-small" onclick="revokeToken(\\'' + t.token + '\\')">Revoke</button> ' : '') +
-        '<button class="btn-small" style="background: #475569;" onclick="deleteToken(\\'' + t.token + '\\')">Delete</button>' +
-      '</td>' +
-    '</tr>';
-  }).join('');
-}
-
-async function generateToken(e) {
-  e.preventDefault();
-  const deviceId = document.getElementById('device-id-input').value.trim();
-  const periodDays = document.getElementById('period-select').value;
-  const note = document.getElementById('note-input').value.trim();
-
-  if (!deviceId) {
-    alert('Please enter the target Device ID');
-    return;
-  }
-
-  try {
-    const res = await fetch('/api/tokens/generate', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ device_id: deviceId, period_days: periodDays, note: note })
+        setInterval(() => {
+            const now = Date.now();
+            for (const [ip, entry] of loginAttempts) {
+                if (entry.resetAt < now) loginAttempts.delete(ip);
+            }
+        }, 10 * 60 * 1000);
     });
-    const data = await res.json();
-    if (data.success) {
-      document.getElementById('device-id-input').value = '';
-      document.getElementById('note-input').value = '';
-      fetchTokens();
-      alert('Token generated successfully: ' + data.token.token + ' for device ' + deviceId);
-    } else {
-      alert('Error: ' + data.message);
-    }
-  } catch (err) {
-    alert('Error generating token: ' + err.message);
-  }
-}
-
-async function revokeToken(token) {
-  if (!confirm('Revoke token ' + token + '? The device will be locked out immediately.')) return;
-  await fetch('/api/tokens/revoke', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ token: token })
-  });
-  fetchTokens();
-}
-
-async function deleteToken(token) {
-  if (!confirm('Delete token ' + token + '?')) return;
-  await fetch('/api/tokens/delete', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ token: token })
-  });
-  fetchTokens();
-}
-
-function copyToken(token) {
-  navigator.clipboard.writeText(token);
-  alert('Copied token: ' + token);
-}
-
-fetchTokens();
-setInterval(fetchTokens, 10000);
-</script>
-</body>
-</html>`;
-}
-
-server.listen(PORT, '0.0.0.0', () => {
-    console.log(`[Verification Server] Running on port ${PORT} connected to Turso Cloud DB`);
-
-    // Keep-alive ping for free-tier hosting (e.g. Render) to prevent sleep after 15 min inactivity
-    const keepAliveUrl = process.env.RENDER_EXTERNAL_URL || 'https://saned-license-server.onrender.com';
-    setInterval(() => {
-        try {
-            const https = require('https');
-            https.get(`${keepAliveUrl}/api/health`, (res) => {
-                console.log(`[Keep-Alive] Pinged ${keepAliveUrl}/api/health -> Status: ${res.statusCode}`);
-            }).on('error', (err) => {
-                console.error('[Keep-Alive] Ping error:', err.message);
-            });
-        } catch (e) {
-            console.error('[Keep-Alive] Exception:', e.message);
-        }
-    }, 8 * 60 * 1000); // Ping every 8 minutes (well under Render's 15-minute idle limit)
+}).catch(err => {
+    console.error('[Startup] Database initialization failed:', err);
+    process.exit(1);
 });
