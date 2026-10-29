@@ -1,9 +1,9 @@
-const http = require('http');
+﻿const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
-const { db, initDB, PERIODS } = require('./lib/db');
+const { db, initDB, PERIODS, DB_MODE, DB_SOURCE } = require('./lib/db');
 const { hashPassword, verifyPassword } = require('./lib/security');
 const {
     createSession,
@@ -142,7 +142,7 @@ async function handleRequest(req, res) {
     }
 
     if (pathname === '/api/health' && method === 'GET') {
-        return sendJson(res, 200, { status: 'ok', time: Date.now(), database: 'turso-libsql' });
+        return sendJson(res, 200, { status: 'ok', time: Date.now(), database: DB_MODE, dbSource: DB_SOURCE });
     }
 
     // ---------------------------------------------------------------- Client API
@@ -927,3 +927,5 @@ initDB().then(() => {
     console.error('[Startup] Database initialization failed:', err);
     process.exit(1);
 });
+
+
