@@ -11,5 +11,21 @@
   },
   "dependencies": {
     "@libsql/client": "^0.18.0"
-  }
+  },
+  "directories": {
+    "lib": "lib"
+  },
+  "devDependencies": {},
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tovfikur/saned-license-server.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/tovfikur/saned-license-server/issues"
+  },
+  "homepage": "https://github.com/tovfikur/saned-license-server#readme"
 }

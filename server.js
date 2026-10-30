@@ -1,4 +1,4 @@
-﻿const http = require('http');
+const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
@@ -18,7 +18,8 @@ const { readJsonBody, sendJson, sendHtml, redirect, getClientIp } = require('./l
 const PORT = process.env.PORT || 8888;
 const PUBLIC_DIR = path.join(__dirname, 'public');
 
-const CHARS = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
+const CHARS = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
+const SECRET_SALT = 'BD_KING_REALTIME_LICENSE_SECURE_2026';
 const USERNAME_RE = /^[a-zA-Z0-9_.-]{3,32}$/;
 const LOGIN_WINDOW_MS = 15 * 60 * 1000;
 const LOGIN_MAX_FAILURES = 5;
@@ -26,18 +27,36 @@ const LOGIN_MAX_FAILURES = 5;
 const pageCache = new Map();
 const loginAttempts = new Map();
 
-function generate8CharToken() {
-    let token = '';
-    const bytes = crypto.randomBytes(8);
-    for (let i = 0; i < 8; i++) {
-        token += CHARS[bytes[i] % CHARS.length];
+function computeTokenChecksum(prefix12) {
+    const hash = crypto.createHash('sha256').update(prefix12 + SECRET_SALT).digest();
+    let sig = '';
+    for (let i = 0; i < 4; i++) {
+        sig += CHARS[hash[i] % CHARS.length];
     }
-    return token;
+    return sig;
+}
+
+function generate16CharToken() {
+    let prefix = '';
+    const bytes = crypto.randomBytes(12);
+    for (let i = 0; i < 12; i++) {
+        prefix += CHARS[bytes[i] % CHARS.length];
+    }
+    return prefix + computeTokenChecksum(prefix);
+}
+
+function isValidTokenFormat(token) {
+    if (typeof token !== 'string' || token.length !== 16) return false;
+    for (let i = 0; i < 16; i++) {
+        if (!CHARS.includes(token[i])) return false;
+    }
+    const prefix = token.slice(0, 12);
+    return token.slice(12) === computeTokenChecksum(prefix);
 }
 
 async function createUniqueToken(executor) {
     for (;;) {
-        const token = generate8CharToken();
+        const token = generate16CharToken();
         const check = await executor.execute({ sql: 'SELECT token FROM tokens WHERE token = ?', args: [token] });
         if (check.rows.length === 0) return token;
     }
@@ -149,11 +168,15 @@ async function handleRequest(req, res) {
     if (pathname === '/api/verify' && method === 'POST') {
         try {
             const body = await readJsonBody(req);
-            const tokenStr = String(body.token || '').trim().toUpperCase();
+            const tokenStr = String(body.token || '').trim();
             const deviceId = String(body.device_id || '').trim().toLowerCase();
 
             if (!tokenStr || !deviceId) {
                 return sendJson(res, 400, { unlocked: false, message: 'Missing token or device_id' });
+            }
+
+            if (!isValidTokenFormat(tokenStr)) {
+                return sendJson(res, 400, { unlocked: false, reason: 'invalid_format', message: 'Invalid 16-character token format' });
             }
 
             const result = await db.execute({
@@ -211,11 +234,15 @@ async function handleRequest(req, res) {
     if (pathname === '/api/activate' && method === 'POST') {
         try {
             const body = await readJsonBody(req);
-            const tokenStr = String(body.token || '').trim().toUpperCase();
+            const tokenStr = String(body.token || '').trim();
             const deviceId = String(body.device_id || '').trim().toLowerCase();
 
             if (!tokenStr || !deviceId) {
                 return sendJson(res, 400, { success: false, unlocked: false, message: 'Missing token or device_id' });
+            }
+
+            if (!isValidTokenFormat(tokenStr)) {
+                return sendJson(res, 400, { success: false, unlocked: false, reason: 'invalid_format', message: 'Invalid 16-character token format' });
             }
 
             const result = await db.execute({
@@ -224,7 +251,7 @@ async function handleRequest(req, res) {
             });
 
             if (result.rows.length === 0) {
-                return sendJson(res, 404, { success: false, unlocked: false, message: 'Invalid 8-character token. Token does not exist.' });
+                return sendJson(res, 404, { success: false, unlocked: false, message: 'Invalid 16-character token. Token does not exist.' });
             }
 
             const found = result.rows[0];
@@ -527,7 +554,7 @@ async function handleRequest(req, res) {
             return sendJson(res, 400, { success: false, message: err.message });
         }
 
-        const tokenStr = String(body.token || '').trim().toUpperCase();
+        const tokenStr = String(body.token || '').trim();
         if (!tokenStr) return sendJson(res, 400, { success: false, message: 'Missing token' });
 
         const result = await db.execute({ sql: 'SELECT token, reseller_id FROM tokens WHERE token = ?', args: [tokenStr] });
@@ -561,7 +588,7 @@ async function handleRequest(req, res) {
         if (!body.token) return sendJson(res, 400, { success: false, message: 'Missing token' });
         await db.execute({
             sql: 'DELETE FROM tokens WHERE token = ?',
-            args: [String(body.token).trim().toUpperCase()]
+            args: [String(body.token).trim()]
         });
         return sendJson(res, 200, { success: true, message: 'Token deleted' });
     }

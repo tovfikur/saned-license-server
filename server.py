@@ -6,9 +6,12 @@ import time
 import secrets
 from urllib.parse import urlparse
 
+import hashlib
+
 PORT = int(os.environ.get("PORT", 8888))
 DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "database.json")
-CHARS = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
+CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+SECRET_SALT = "BD_KING_REALTIME_LICENSE_SECURE_2026"
 
 def load_db():
     if os.path.exists(DB_FILE):
@@ -25,8 +28,23 @@ def save_db(data):
     with open(DB_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
 
-def generate_8char_token():
-    return "".join(secrets.choice(CHARS) for _ in range(8))
+def compute_token_checksum(prefix12):
+    h = hashlib.sha256((prefix12 + SECRET_SALT).encode("utf-8")).digest()
+    sig = ""
+    for i in range(4):
+        sig += CHARS[h[i] % len(CHARS)]
+    return sig
+
+def generate_16char_token():
+    prefix = "".join(secrets.choice(CHARS) for _ in range(12))
+    return prefix + compute_token_checksum(prefix)
+
+def is_valid_token_format(token):
+    if not isinstance(token, str) or len(token) != 16:
+        return False
+    if any(c not in CHARS for c in token):
+        return False
+    return token[12:] == compute_token_checksum(token[:12])
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def send_cors(self):
@@ -83,10 +101,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         now = int(time.time() * 1000)
 
         if parsed.path == "/api/verify":
-            token_str = str(body.get("token", "")).strip().upper()
+            token_str = str(body.get("token", "")).strip()
             device_id = str(body.get("device_id", "")).strip()
             if not token_str or not device_id:
                 return self.send_json(400, {"unlocked": False, "message": "Missing token or device_id"})
+            if not is_valid_token_format(token_str):
+                return self.send_json(400, {"unlocked": False, "reason": "invalid_format", "message": "Invalid 16-character token format"})
             found = next((t for t in db["tokens"] if t["token"] == token_str), None)
             if not found:
                 return self.send_json(404, {"unlocked": False, "reason": "not_found", "message": "Token not found"})
@@ -102,13 +122,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.send_json(200, {"unlocked": True, "token": found["token"], "expires_at": found.get("expiresAt"), "days_left": days_left})
 
         if parsed.path == "/api/activate":
-            token_str = str(body.get("token", "")).strip().upper()
+            token_str = str(body.get("token", "")).strip()
             device_id = str(body.get("device_id", "")).strip()
             if not token_str or not device_id:
                 return self.send_json(400, {"success": False, "unlocked": False, "message": "Missing token or device_id"})
+            if not is_valid_token_format(token_str):
+                return self.send_json(400, {"success": False, "unlocked": False, "reason": "invalid_format", "message": "Invalid 16-character token format"})
             found = next((t for t in db["tokens"] if t["token"] == token_str), None)
             if not found:
-                return self.send_json(404, {"success": False, "unlocked": False, "message": "Invalid 8-character token"})
+                return self.send_json(404, {"success": False, "unlocked": False, "message": "Invalid 16-character token"})
             if found.get("status") == "revoked":
                 return self.send_json(403, {"success": False, "unlocked": False, "message": "Token has been revoked"})
             if found.get("deviceId") and found["deviceId"] != device_id:
@@ -129,9 +151,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if parsed.path == "/api/tokens/generate":
             period_days = int(body.get("period_days", 30))
             note = str(body.get("note", "")).strip()
-            token = generate_8char_token()
+            token = generate_16char_token()
             while any(t["token"] == token for t in db["tokens"]):
-                token = generate_8char_token()
+                token = generate_16char_token()
             new_t = {
                 "token": token,
                 "periodDays": period_days,
