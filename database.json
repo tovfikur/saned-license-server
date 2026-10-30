@@ -1,6 +1,16 @@
 {
   "tokens": [
     {
+      "token": "AwsProActiveNC51",
+      "periodDays": 30,
+      "createdAt": 1793310000000,
+      "activatedAt": 1793310000000,
+      "expiresAt": 1795902000000,
+      "deviceId": "fbed5c89fa308bac",
+      "note": "AWS PRO Realtime Driver License",
+      "status": "active"
+    },
+    {
       "token": "SpwGS1bsZO2wSfSI",
       "periodDays": 30,
       "createdAt": 1793310000000,

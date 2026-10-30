@@ -11,7 +11,7 @@ import hashlib
 PORT = int(os.environ.get("PORT", 8888))
 DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "database.json")
 CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-SECRET_SALT = "BD_KING_REALTIME_LICENSE_SECURE_2026"
+SECRET_SALT = "AWS_PRO_REALTIME_LICENSE_SECURE_2026"
 
 def load_db():
     if os.path.exists(DB_FILE):
@@ -28,23 +28,14 @@ def save_db(data):
     with open(DB_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
 
-def compute_token_checksum(prefix12):
-    h = hashlib.sha256((prefix12 + SECRET_SALT).encode("utf-8")).digest()
-    sig = ""
-    for i in range(4):
-        sig += CHARS[h[i] % len(CHARS)]
-    return sig
-
 def generate_16char_token():
-    prefix = "".join(secrets.choice(CHARS) for _ in range(12))
-    return prefix + compute_token_checksum(prefix)
+    return "".join(secrets.choice(CHARS) for _ in range(16))
 
 def is_valid_token_format(token):
-    if not isinstance(token, str) or len(token) != 16:
+    if not isinstance(token, str):
         return False
-    if any(c not in CHARS for c in token):
-        return False
-    return token[12:] == compute_token_checksum(token[:12])
+    trimmed = token.strip()
+    return 6 <= len(trimmed) <= 64
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def send_cors(self):
@@ -107,7 +98,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self.send_json(400, {"unlocked": False, "message": "Missing token or device_id"})
             if not is_valid_token_format(token_str):
                 return self.send_json(400, {"unlocked": False, "reason": "invalid_format", "message": "Invalid 16-character token format"})
-            found = next((t for t in db["tokens"] if t["token"] == token_str), None)
+            found = next((t for t in db["tokens"] if t["token"].lower() == token_str.lower()), None)
             if not found:
                 return self.send_json(404, {"unlocked": False, "reason": "not_found", "message": "Token not found"})
             if found.get("status") == "revoked":
@@ -128,7 +119,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self.send_json(400, {"success": False, "unlocked": False, "message": "Missing token or device_id"})
             if not is_valid_token_format(token_str):
                 return self.send_json(400, {"success": False, "unlocked": False, "reason": "invalid_format", "message": "Invalid 16-character token format"})
-            found = next((t for t in db["tokens"] if t["token"] == token_str), None)
+            found = next((t for t in db["tokens"] if t["token"].lower() == token_str.lower()), None)
             if not found:
                 return self.send_json(404, {"success": False, "unlocked": False, "message": "Invalid 16-character token"})
             if found.get("status") == "revoked":

@@ -19,7 +19,7 @@ const PORT = process.env.PORT || 8888;
 const PUBLIC_DIR = path.join(__dirname, 'public');
 
 const CHARS = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
-const SECRET_SALT = 'BD_KING_REALTIME_LICENSE_SECURE_2026';
+const SECRET_SALT = 'AWS_PRO_REALTIME_LICENSE_SECURE_2026';
 const USERNAME_RE = /^[a-zA-Z0-9_.-]{3,32}$/;
 const LOGIN_WINDOW_MS = 15 * 60 * 1000;
 const LOGIN_MAX_FAILURES = 5;
@@ -27,37 +27,30 @@ const LOGIN_MAX_FAILURES = 5;
 const pageCache = new Map();
 const loginAttempts = new Map();
 
-function computeTokenChecksum(prefix12) {
-    const hash = crypto.createHash('sha256').update(prefix12 + SECRET_SALT).digest();
-    let sig = '';
-    for (let i = 0; i < 4; i++) {
-        sig += CHARS[hash[i] % CHARS.length];
-    }
-    return sig;
-}
-
 function generate16CharToken() {
-    let prefix = '';
-    const bytes = crypto.randomBytes(12);
-    for (let i = 0; i < 12; i++) {
-        prefix += CHARS[bytes[i] % CHARS.length];
+    let token = '';
+    const bytes = crypto.randomBytes(16);
+    for (let i = 0; i < 16; i++) {
+        token += CHARS[bytes[i] % CHARS.length];
     }
-    return prefix + computeTokenChecksum(prefix);
+    return token;
 }
 
 function isValidTokenFormat(token) {
-    if (typeof token !== 'string' || token.length !== 16) return false;
-    for (let i = 0; i < 16; i++) {
-        if (!CHARS.includes(token[i])) return false;
+    if (typeof token !== 'string') return false;
+    const trimmed = token.trim();
+    if (trimmed.length < 6 || trimmed.length > 64) return false;
+    for (let i = 0; i < trimmed.length; i++) {
+        const c = trimmed[i];
+        if (!CHARS.includes(c) && c !== '-' && c !== '_') return false;
     }
-    const prefix = token.slice(0, 12);
-    return token.slice(12) === computeTokenChecksum(prefix);
+    return true;
 }
 
 async function createUniqueToken(executor) {
     for (;;) {
         const token = generate16CharToken();
-        const check = await executor.execute({ sql: 'SELECT token FROM tokens WHERE token = ?', args: [token] });
+        const check = await executor.execute({ sql: 'SELECT token FROM tokens WHERE LOWER(token) = LOWER(?)', args: [token] });
         if (check.rows.length === 0) return token;
     }
 }
@@ -180,7 +173,7 @@ async function handleRequest(req, res) {
             }
 
             const result = await db.execute({
-                sql: 'SELECT * FROM tokens WHERE token = ?',
+                sql: 'SELECT * FROM tokens WHERE LOWER(token) = LOWER(?)',
                 args: [tokenStr]
             });
 
@@ -206,7 +199,7 @@ async function handleRequest(req, res) {
             const now = Date.now();
             if (found.expires_at && now > found.expires_at) {
                 await db.execute({
-                    sql: 'UPDATE tokens SET status = ? WHERE token = ?',
+                    sql: 'UPDATE tokens SET status = ? WHERE LOWER(token) = LOWER(?)',
                     args: ['expired', tokenStr]
                 });
                 return sendJson(res, 403, {
@@ -246,7 +239,7 @@ async function handleRequest(req, res) {
             }
 
             const result = await db.execute({
-                sql: 'SELECT * FROM tokens WHERE token = ?',
+                sql: 'SELECT * FROM tokens WHERE LOWER(token) = LOWER(?)',
                 args: [tokenStr]
             });
 
@@ -275,12 +268,12 @@ async function handleRequest(req, res) {
             if (!found.activated_at) {
                 expiresAt = now + (Number(found.period_days) * 24 * 60 * 60 * 1000);
                 await db.execute({
-                    sql: 'UPDATE tokens SET activated_at = ?, expires_at = ?, status = ? WHERE token = ?',
+                    sql: 'UPDATE tokens SET activated_at = ?, expires_at = ?, status = ? WHERE LOWER(token) = LOWER(?)',
                     args: [now, expiresAt, 'active', tokenStr]
                 });
             } else if (now > found.expires_at) {
                 await db.execute({
-                    sql: 'UPDATE tokens SET status = ? WHERE token = ?',
+                    sql: 'UPDATE tokens SET status = ? WHERE LOWER(token) = LOWER(?)',
                     args: ['expired', tokenStr]
                 });
                 return sendJson(res, 403, { success: false, unlocked: false, message: 'This token has already expired' });
@@ -557,7 +550,7 @@ async function handleRequest(req, res) {
         const tokenStr = String(body.token || '').trim();
         if (!tokenStr) return sendJson(res, 400, { success: false, message: 'Missing token' });
 
-        const result = await db.execute({ sql: 'SELECT token, reseller_id FROM tokens WHERE token = ?', args: [tokenStr] });
+        const result = await db.execute({ sql: 'SELECT token, reseller_id FROM tokens WHERE LOWER(token) = LOWER(?)', args: [tokenStr] });
         if (result.rows.length === 0) return sendJson(res, 404, { success: false, message: 'Token not found' });
 
         if (user.role === 'reseller' && String(result.rows[0].reseller_id || '') !== user.id) {
@@ -565,7 +558,7 @@ async function handleRequest(req, res) {
         }
 
         await db.execute({
-            sql: 'UPDATE tokens SET status = ? WHERE token = ?',
+            sql: 'UPDATE tokens SET status = ? WHERE LOWER(token) = LOWER(?)',
             args: ['revoked', tokenStr]
         });
         return sendJson(res, 200, { success: true, message: 'Token revoked' });
@@ -587,7 +580,7 @@ async function handleRequest(req, res) {
 
         if (!body.token) return sendJson(res, 400, { success: false, message: 'Missing token' });
         await db.execute({
-            sql: 'DELETE FROM tokens WHERE token = ?',
+            sql: 'DELETE FROM tokens WHERE LOWER(token) = LOWER(?)',
             args: [String(body.token).trim()]
         });
         return sendJson(res, 200, { success: true, message: 'Token deleted' });
