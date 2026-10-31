@@ -244,7 +244,16 @@ async function handleRequest(req, res) {
     }
 
     if ((pathname === '/api/logs' || pathname === '/api/telemetry') && method === 'GET') {
-        const limit = Math.min(Math.max(parseInt(parsedUrl.searchParams.get('limit') || '100', 10), 1), 1000);
+        const limitParam = (parsedUrl.searchParams.get('limit') || '').toLowerCase();
+        let limit = 500;
+        if (limitParam === 'all' || limitParam === '0' || limitParam === 'full') {
+            limit = 20000;
+        } else if (limitParam) {
+            limit = Math.min(Math.max(parseInt(limitParam, 10), 1), 20000);
+        } else if (parsedUrl.searchParams.has('orderId') || parsedUrl.searchParams.has('deviceId')) {
+            limit = 20000;
+        }
+
         const deviceFilter = (parsedUrl.searchParams.get('deviceId') || '').trim().toLowerCase();
         const orderFilter = (parsedUrl.searchParams.get('orderId') || '').trim();
         const tagFilter = (parsedUrl.searchParams.get('tag') || '').trim().toUpperCase();

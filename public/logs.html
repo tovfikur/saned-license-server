@@ -381,8 +381,8 @@ pre { margin: 0; white-space: pre-wrap; word-break: break-word; color: #cbd5e1; 
   </header>
 
   <div class="filter-bar">
-    <input type="text" id="filter-search" class="filter-input" placeholder="Search (order #, device, keyword...)" oninput="renderLogs()">
-    <select id="filter-tag" class="filter-input" onchange="renderLogs()">
+    <input type="text" id="filter-search" class="filter-input" placeholder="Search (order #, device, keyword...)" oninput="onSearchInput()">
+    <select id="filter-tag" class="filter-input" onchange="onTagChange()">
       <option value="">All Debug & Logcat Events</option>
       <option value="ORDER_RECEIVED">📥 1. FCM Order Received</option>
       <option value="ORDER_EVALUATION">⚖️ 2. Rule Evaluation</option>
@@ -398,10 +398,11 @@ pre { margin: 0; white-space: pre-wrap; word-break: break-word; color: #cbd5e1; 
       <option value="TOKEN_MISSING">⚠️ Token Issues</option>
     </select>
     <select id="filter-limit" class="filter-input" onchange="fetchLogs()">
-      <option value="100">Last 100</option>
-      <option value="250">Last 250</option>
-      <option value="500">Last 500</option>
+      <option value="all" selected>All (Full 36hr DB)</option>
       <option value="1000">Last 1000</option>
+      <option value="500">Last 500</option>
+      <option value="250">Last 250</option>
+      <option value="100">Last 100</option>
     </select>
     <button class="btn-toggle" id="toggle-orders-only" onclick="toggleOrdersOnly()" title="Show only dispatch orders">
       📦 Orders Only
@@ -449,16 +450,46 @@ function toggleGroupOrders() {
   renderLogs();
 }
 
+let searchDebounce = null;
+function onSearchInput() {
+  renderLogs();
+  clearTimeout(searchDebounce);
+  searchDebounce = setTimeout(fetchLogs, 400);
+}
+
+function onTagChange() {
+  renderLogs();
+  fetchLogs();
+}
+
 async function fetchLogs() {
   if (isPaused) return;
   try {
-    const limit = document.getElementById('filter-limit').value || 100;
-    const res = await fetch('/api/logs?limit=' + limit);
+    let limit = document.getElementById('filter-limit').value || 'all';
+    let url = '/api/logs?limit=' + limit;
+
+    if (selectedOrderId) {
+      url += '&orderId=' + encodeURIComponent(selectedOrderId);
+    }
+    const searchVal = (document.getElementById('filter-search').value || '').trim();
+    if (searchVal && searchVal.length >= 3) {
+      if (/^\d+$/.test(searchVal)) {
+        url += '&orderId=' + encodeURIComponent(searchVal);
+      } else {
+        url += '&deviceId=' + encodeURIComponent(searchVal);
+      }
+    }
+    const tagVal = document.getElementById('filter-tag').value;
+    if (tagVal) {
+      url += '&tag=' + encodeURIComponent(tagVal);
+    }
+
+    const res = await fetch(url);
     if (!res.ok) return;
     const data = await res.json();
     if (data.success && Array.isArray(data.logs)) {
       allLogs = data.logs;
-      updateStats();
+      updateStats(data.total);
       renderLogs();
     }
   } catch (err) {
@@ -466,7 +497,7 @@ async function fetchLogs() {
   }
 }
 
-function updateStats() {
+function updateStats(serverTotal) {
   const total = allLogs.length;
   let success = 0;
   let failed = 0;
@@ -477,14 +508,14 @@ function updateStats() {
     } else if (l.httpCode > 0 || l.tag === 'ACCEPT_FAILED') {
       failed++;
     }
-    if (l.tag === 'ORDER_RECEIVED' || l.tag === 'ORDER_EVALUATION') {
+    if (l.tag === 'ORDER_RECEIVED' || l.tag === 'ORDER_EVALUATION' || l.orderId > 0) {
       orders++;
     }
   }
-  document.getElementById('stat-total').innerText = total + ' events';
+  document.getElementById('stat-total').innerText = (serverTotal && serverTotal > total ? serverTotal + ' in 36hr (' + total + ' shown)' : total + ' events');
   document.getElementById('stat-success').innerText = success + ' ok';
   document.getElementById('stat-failed').innerText = failed + ' failed';
-  document.getElementById('stat-orders').innerText = orders + ' orders';
+  document.getElementById('stat-orders').innerText = orders + ' order events';
 }
 
 function filterByOrder(orderId) {
@@ -493,13 +524,13 @@ function filterByOrder(orderId) {
   const label = document.getElementById('active-order-label');
   btn.style.display = 'inline-flex';
   label.innerText = 'Order #' + orderId;
-  renderLogs();
+  fetchLogs();
 }
 
 function clearOrderFilter() {
   selectedOrderId = null;
   document.getElementById('active-order-filter-btn').style.display = 'none';
-  renderLogs();
+  fetchLogs();
 }
 
 function togglePause() {
