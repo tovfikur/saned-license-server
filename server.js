@@ -3,7 +3,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
-const { db, initDB, PERIODS, DB_MODE, DB_SOURCE } = require('./lib/db');
+const { db, initDB, cleanupOldLogs, RETENTION_MS, PERIODS, DB_MODE, DB_SOURCE } = require('./lib/db');
 const { hashPassword, verifyPassword } = require('./lib/security');
 const {
     createSession,
@@ -191,6 +191,30 @@ async function handleRequest(req, res) {
                 orderLogs.length = MAX_LOGS;
             }
 
+            // Persist to 36-hour database storage asynchronously
+            db.execute({
+                sql: `INSERT OR REPLACE INTO telemetry_logs 
+                      (id, timestamp, received_at, ip, tag, order_id, device_id, url, method, headers_json, http_code, response_body, duration_ms, error, details_json)
+                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                args: [
+                    logEntry.id,
+                    logEntry.timestamp,
+                    logEntry.receivedAt,
+                    logEntry.ip,
+                    logEntry.tag,
+                    logEntry.orderId,
+                    logEntry.deviceId,
+                    logEntry.url,
+                    logEntry.method,
+                    logEntry.headers && Object.keys(logEntry.headers).length > 0 ? JSON.stringify(logEntry.headers) : null,
+                    logEntry.httpCode,
+                    logEntry.responseBody,
+                    logEntry.durationMs,
+                    logEntry.error,
+                    logEntry.details ? JSON.stringify(logEntry.details) : null
+                ]
+            }).catch(e => console.error('[Turso] Telemetry insert failed:', e.message));
+
             console.log(`[TELEMETRY] [${logEntry.tag}] Order #${logEntry.orderId} Code:${logEntry.httpCode} Dev:${logEntry.deviceId} Latency:${logEntry.durationMs}ms Err:${logEntry.error || 'none'}`);
             return sendJson(res, 200, { success: true, count: orderLogs.length, id: logEntry.id });
         } catch (err) {
@@ -204,42 +228,109 @@ async function handleRequest(req, res) {
         ((pathname === '/api/logs' || pathname === '/api/telemetry') && (method === 'DELETE' || parsedUrl.searchParams.get('clear') === 'true'))) {
         const targetDevice = (parsedUrl.searchParams.get('deviceId') || '').trim().toLowerCase();
         if (targetDevice) {
+            await db.execute({ sql: 'DELETE FROM telemetry_logs WHERE LOWER(device_id) = ?', args: [targetDevice] }).catch(() => {});
             const before = orderLogs.length;
             for (let i = orderLogs.length - 1; i >= 0; i--) {
                 if (orderLogs[i].deviceId && orderLogs[i].deviceId.toLowerCase() === targetDevice) {
                     orderLogs.splice(i, 1);
                 }
             }
-            return sendJson(res, 200, { success: true, message: `Cleared logs for device ${targetDevice}`, count: orderLogs.length, removed: before - orderLogs.length });
+            return sendJson(res, 200, { success: true, message: `Cleared persistent logs for device ${targetDevice}`, count: orderLogs.length, removed: before - orderLogs.length });
         } else {
+            await db.execute('DELETE FROM telemetry_logs').catch(() => {});
             orderLogs.length = 0;
-            return sendJson(res, 200, { success: true, message: 'All logs cleared from server buffer', count: 0 });
+            return sendJson(res, 200, { success: true, message: 'All 36hr logs cleared from database', count: 0 });
         }
     }
 
     if ((pathname === '/api/logs' || pathname === '/api/telemetry') && method === 'GET') {
-        const limit = Math.min(Math.max(parseInt(parsedUrl.searchParams.get('limit') || '100', 10), 1), 500);
+        const limit = Math.min(Math.max(parseInt(parsedUrl.searchParams.get('limit') || '100', 10), 1), 1000);
         const deviceFilter = (parsedUrl.searchParams.get('deviceId') || '').trim().toLowerCase();
         const orderFilter = (parsedUrl.searchParams.get('orderId') || '').trim();
         const tagFilter = (parsedUrl.searchParams.get('tag') || '').trim().toUpperCase();
 
-        let filtered = orderLogs;
-        if (deviceFilter) {
-            filtered = filtered.filter(l => l.deviceId.toLowerCase().includes(deviceFilter));
-        }
-        if (orderFilter) {
-            filtered = filtered.filter(l => String(l.orderId) === orderFilter);
-        }
-        if (tagFilter) {
-            filtered = filtered.filter(l => l.tag.includes(tagFilter));
-        }
+        try {
+            const retentionWindow = Date.now() - RETENTION_MS;
+            let sql = 'SELECT * FROM telemetry_logs WHERE timestamp >= ?';
+            let countSql = 'SELECT COUNT(*) as total FROM telemetry_logs WHERE timestamp >= ?';
+            const args = [retentionWindow];
+            const countArgs = [retentionWindow];
 
-        return sendJson(res, 200, {
-            success: true,
-            total: orderLogs.length,
-            returned: Math.min(filtered.length, limit),
-            logs: filtered.slice(0, limit)
-        });
+            if (deviceFilter) {
+                sql += ' AND LOWER(device_id) LIKE ?';
+                countSql += ' AND LOWER(device_id) LIKE ?';
+                args.push(`%${deviceFilter}%`);
+                countArgs.push(`%${deviceFilter}%`);
+            }
+            if (orderFilter) {
+                sql += ' AND order_id = ?';
+                countSql += ' AND order_id = ?';
+                args.push(parseInt(orderFilter, 10) || 0);
+                countArgs.push(parseInt(orderFilter, 10) || 0);
+            }
+            if (tagFilter) {
+                sql += ' AND tag LIKE ?';
+                countSql += ' AND tag LIKE ?';
+                args.push(`%${tagFilter}%`);
+                countArgs.push(`%${tagFilter}%`);
+            }
+
+            sql += ' ORDER BY timestamp DESC LIMIT ?';
+            args.push(limit);
+
+            const [rowsResult, countResult] = await Promise.all([
+                db.execute({ sql, args }),
+                db.execute({ sql: countSql, args: countArgs })
+            ]);
+
+            const dbLogs = rowsResult.rows.map(row => ({
+                id: String(row.id),
+                timestamp: Number(row.timestamp),
+                receivedAt: Number(row.received_at),
+                ip: row.ip,
+                tag: row.tag,
+                orderId: Number(row.order_id),
+                deviceId: row.device_id,
+                url: row.url,
+                method: row.method,
+                headers: row.headers_json ? JSON.parse(row.headers_json) : {},
+                httpCode: Number(row.http_code),
+                responseBody: row.response_body || '',
+                durationMs: Number(row.duration_ms),
+                error: row.error || '',
+                details: row.details_json ? JSON.parse(row.details_json) : null
+            }));
+
+            const totalCount = countResult.rows[0] ? Number(countResult.rows[0].total) : dbLogs.length;
+
+            return sendJson(res, 200, {
+                success: true,
+                total: totalCount,
+                returned: dbLogs.length,
+                retention: '36hr',
+                logs: dbLogs
+            });
+        } catch (dbErr) {
+            console.error('[Telemetry DB Query Error]', dbErr.message);
+            let filtered = orderLogs;
+            if (deviceFilter) {
+                filtered = filtered.filter(l => l.deviceId.toLowerCase().includes(deviceFilter));
+            }
+            if (orderFilter) {
+                filtered = filtered.filter(l => String(l.orderId) === orderFilter);
+            }
+            if (tagFilter) {
+                filtered = filtered.filter(l => l.tag.includes(tagFilter));
+            }
+
+            return sendJson(res, 200, {
+                success: true,
+                total: orderLogs.length,
+                returned: Math.min(filtered.length, limit),
+                retention: 'memory-fallback',
+                logs: filtered.slice(0, limit)
+            });
+        }
     }
 
     // ---------------------------------------------------------------- Legacy Adapter Routes
@@ -907,9 +998,41 @@ const server = http.createServer((req, res) => {
     });
 });
 
-initDB().then(() => {
+initDB().then(async () => {
+    // Warm up in-memory orderLogs cache from persistent database (up to 500 latest entries)
+    try {
+        const recent = await db.execute('SELECT * FROM telemetry_logs ORDER BY timestamp DESC LIMIT 500');
+        for (const row of recent.rows) {
+            orderLogs.push({
+                id: String(row.id),
+                timestamp: Number(row.timestamp),
+                receivedAt: Number(row.received_at),
+                ip: row.ip,
+                tag: row.tag,
+                orderId: Number(row.order_id),
+                deviceId: row.device_id,
+                url: row.url,
+                method: row.method,
+                headers: row.headers_json ? JSON.parse(row.headers_json) : {},
+                httpCode: Number(row.http_code),
+                responseBody: row.response_body || '',
+                durationMs: Number(row.duration_ms),
+                error: row.error || '',
+                details: row.details_json ? JSON.parse(row.details_json) : null
+            });
+        }
+        console.log(`[Startup] Warmed in-memory buffer with ${orderLogs.length} persistent logs from Turso`);
+    } catch (e) {
+        console.warn('[Startup] Could not warm log buffer:', e.message);
+    }
+
     server.listen(PORT, '0.0.0.0', () => {
         console.log(`[Verification Server] Running on port ${PORT}`);
+
+        // Hourly cleanup of logs older than 36 hours
+        setInterval(() => {
+            cleanupOldLogs().catch(() => {});
+        }, 60 * 60 * 1000);
 
         const keepAliveUrl = process.env.RENDER_EXTERNAL_URL || 'https://saned-license-server.onrender.com';
         setInterval(() => {
