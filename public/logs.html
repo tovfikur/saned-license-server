@@ -298,7 +298,7 @@ pre { margin: 0; white-space: pre-wrap; word-break: break-word; color: #cbd5e1; 
   <div class="filter-bar">
     <input type="text" id="filter-search" class="filter-input" placeholder="Search (order #, device, keyword...)" oninput="renderLogs()">
     <select id="filter-tag" class="filter-input" onchange="renderLogs()">
-      <option value="">All Debug Events</option>
+      <option value="">All Debug & Logcat Events</option>
       <option value="ORDER_RECEIVED">📥 1. FCM Order Received</option>
       <option value="ORDER_EVALUATION">⚖️ 2. Rule Evaluation</option>
       <option value="NATIVE_PREP">🔑 3. Native & Token Prep</option>
@@ -306,6 +306,9 @@ pre { margin: 0; white-space: pre-wrap; word-break: break-word; color: #cbd5e1; 
       <option value="ACCEPT_SUCCESS">✅ 5. Accept Success (2xx)</option>
       <option value="ACCEPT_FAILED">❌ 6. Accept Failed (4xx/5xx/0)</option>
       <option value="UI_FEEDBACK">💬 7. UI Toast Feedback</option>
+      <option value="LOGCAT">📜 Continuous Logcat</option>
+      <option value="CRASH">💥 Crashes & Fatal Errors</option>
+      <option value="APP_STARTUP">📱 App Startup & Device Info</option>
       <option value="TOKEN_MISSING">⚠️ Token Issues</option>
     </select>
     <select id="filter-limit" class="filter-input" onchange="fetchLogs()">
@@ -456,6 +459,9 @@ function getTagDisplay(tag) {
     case 'ACCEPT_SUCCESS': return { icon: '✅', label: '5. ACCEPT SUCCESS (2xx)' };
     case 'ACCEPT_FAILED': return { icon: '❌', label: '5. ACCEPT FAILED' };
     case 'UI_FEEDBACK': return { icon: '💬', label: '6. UI TOAST' };
+    case 'LOGCAT': return { icon: '📜', label: 'APP LOGCAT' };
+    case 'CRASH': return { icon: '💥', label: 'FATAL CRASH' };
+    case 'APP_STARTUP': return { icon: '📱', label: 'APP STARTUP' };
     case 'TOKEN_MISSING': return { icon: '⚠️', label: 'TOKEN ISSUE' };
     default: return { icon: 'ℹ️', label: tag };
   }
