@@ -14,6 +14,8 @@ const {
     clearSessionCookie
 } = require('./lib/auth');
 const { readJsonBody, sendJson, sendHtml, redirect, getClientIp } = require('./lib/http');
+const { activateLicense, verifyLicense } = require('./lib/license-service');
+const { handleLegacyLogin, handleLegacyRefresh } = require('./lib/legacy-adapter');
 
 const PORT = process.env.PORT || 8888;
 const PUBLIC_DIR = path.join(__dirname, 'public');
@@ -141,10 +143,10 @@ async function handleRequest(req, res) {
     const pathname = parsedUrl.pathname;
     const method = req.method;
 
-    if (['/api/verify', '/api/activate', '/api/health'].includes(pathname)) {
+    if (['/api/verify', '/api/activate', '/api/health', '/api/legacy/auth/login', '/api/legacy/auth/refresh'].includes(pathname)) {
         res.setHeader('Access-Control-Allow-Origin', '*');
         res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-        res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+        res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-device-id, X-App-Version, X-App-Cert, X-Nonce');
     }
 
     if (method === 'OPTIONS') {
@@ -157,68 +159,27 @@ async function handleRequest(req, res) {
         return sendJson(res, 200, { status: 'ok', time: Date.now(), database: DB_MODE, dbSource: DB_SOURCE });
     }
 
+    // ---------------------------------------------------------------- Legacy Adapter Routes
+    const hostHeader = (req.headers.host || '').toLowerCase();
+    const isLegacyHost = hostHeader.includes('drivers-dashboard.com') || process.env.IS_LEGACY_HOST === 'true';
+
+    if ((pathname === '/api/legacy/auth/login' || (isLegacyHost && pathname === '/api/auth/login')) && method === 'POST') {
+        return handleLegacyLogin(req, res);
+    }
+
+    if ((pathname === '/api/legacy/auth/refresh' || (isLegacyHost && pathname === '/api/auth/refresh')) && method === 'POST') {
+        return handleLegacyRefresh(req, res);
+    }
+
     // ---------------------------------------------------------------- Client API
     if (pathname === '/api/verify' && method === 'POST') {
         try {
             const body = await readJsonBody(req);
-            const tokenStr = String(body.token || '').trim();
-            const deviceId = String(body.device_id || '').trim().toLowerCase();
-
-            if (!tokenStr || !deviceId) {
-                return sendJson(res, 400, { unlocked: false, message: 'Missing token or device_id' });
-            }
-
-            if (!isValidTokenFormat(tokenStr)) {
-                return sendJson(res, 400, { unlocked: false, reason: 'invalid_format', message: 'Invalid 16-character token format' });
-            }
-
-            const result = await db.execute({
-                sql: 'SELECT * FROM tokens WHERE LOWER(token) = LOWER(?)',
-                args: [tokenStr]
+            const result = await verifyLicense({
+                token: body.token,
+                deviceId: body.device_id
             });
-
-            if (result.rows.length === 0) {
-                return sendJson(res, 404, { unlocked: false, reason: 'not_found', message: 'Invalid token. Token not found.' });
-            }
-
-            const found = result.rows[0];
-            const preSetDevice = String(found.device_id || '').trim().toLowerCase();
-
-            if (preSetDevice !== deviceId) {
-                return sendJson(res, 403, {
-                    unlocked: false,
-                    reason: 'device_mismatch',
-                    message: `Device mismatch! This token was generated for device ${preSetDevice}`
-                });
-            }
-
-            if (found.status === 'revoked') {
-                return sendJson(res, 403, { unlocked: false, reason: 'revoked', message: 'Token has been revoked by admin' });
-            }
-
-            const now = Date.now();
-            if (found.expires_at && now > found.expires_at) {
-                await db.execute({
-                    sql: 'UPDATE tokens SET status = ? WHERE LOWER(token) = LOWER(?)',
-                    args: ['expired', tokenStr]
-                });
-                return sendJson(res, 403, {
-                    unlocked: false,
-                    reason: 'expired',
-                    expires_at: found.expires_at,
-                    message: `Subscription expired on ${new Date(Number(found.expires_at)).toLocaleDateString()}`
-                });
-            }
-
-            const daysLeft = found.expires_at ? Math.max(0, Math.ceil((Number(found.expires_at) - now) / (1000 * 60 * 60 * 24))) : Number(found.period_days);
-            return sendJson(res, 200, {
-                unlocked: true,
-                token: found.token,
-                expires_at: found.expires_at,
-                days_left: daysLeft,
-                period_days: found.period_days,
-                message: 'Active license verified'
-            });
+            return sendJson(res, result.statusCode, result.body);
         } catch (err) {
             return sendJson(res, 500, { unlocked: false, message: 'Server error: ' + err.message });
         }
@@ -227,68 +188,11 @@ async function handleRequest(req, res) {
     if (pathname === '/api/activate' && method === 'POST') {
         try {
             const body = await readJsonBody(req);
-            const tokenStr = String(body.token || '').trim();
-            const deviceId = String(body.device_id || '').trim().toLowerCase();
-
-            if (!tokenStr || !deviceId) {
-                return sendJson(res, 400, { success: false, unlocked: false, message: 'Missing token or device_id' });
-            }
-
-            if (!isValidTokenFormat(tokenStr)) {
-                return sendJson(res, 400, { success: false, unlocked: false, reason: 'invalid_format', message: 'Invalid 16-character token format' });
-            }
-
-            const result = await db.execute({
-                sql: 'SELECT * FROM tokens WHERE LOWER(token) = LOWER(?)',
-                args: [tokenStr]
+            const result = await activateLicense({
+                token: body.token,
+                deviceId: body.device_id
             });
-
-            if (result.rows.length === 0) {
-                return sendJson(res, 404, { success: false, unlocked: false, message: 'Invalid 16-character token. Token does not exist.' });
-            }
-
-            const found = result.rows[0];
-            const preSetDevice = String(found.device_id || '').trim().toLowerCase();
-
-            if (preSetDevice !== deviceId) {
-                return sendJson(res, 403, {
-                    success: false,
-                    unlocked: false,
-                    message: `Wrong device! This token was issued for device ID: ${preSetDevice}`
-                });
-            }
-
-            if (found.status === 'revoked') {
-                return sendJson(res, 403, { success: false, unlocked: false, message: 'This token has been revoked by admin' });
-            }
-
-            const now = Date.now();
-            let expiresAt = found.expires_at;
-
-            if (!found.activated_at) {
-                expiresAt = now + (Number(found.period_days) * 24 * 60 * 60 * 1000);
-                await db.execute({
-                    sql: 'UPDATE tokens SET activated_at = ?, expires_at = ?, status = ? WHERE LOWER(token) = LOWER(?)',
-                    args: [now, expiresAt, 'active', tokenStr]
-                });
-            } else if (now > found.expires_at) {
-                await db.execute({
-                    sql: 'UPDATE tokens SET status = ? WHERE LOWER(token) = LOWER(?)',
-                    args: ['expired', tokenStr]
-                });
-                return sendJson(res, 403, { success: false, unlocked: false, message: 'This token has already expired' });
-            }
-
-            const daysLeft = Math.max(0, Math.ceil((Number(expiresAt) - now) / (1000 * 60 * 60 * 24)));
-            return sendJson(res, 200, {
-                success: true,
-                unlocked: true,
-                token: found.token,
-                expires_at: expiresAt,
-                days_left: daysLeft,
-                period_days: found.period_days,
-                message: 'Device verified and unlocked!'
-            });
+            return sendJson(res, result.statusCode, result.body);
         } catch (err) {
             return sendJson(res, 500, { success: false, unlocked: false, message: 'Server error: ' + err.message });
         }
@@ -430,13 +334,11 @@ async function handleRequest(req, res) {
             return sendJson(res, 400, { success: false, message: err.message });
         }
 
-        const deviceId = String(body.device_id || '').trim().toLowerCase();
+        const deviceId = body.device_id && String(body.device_id).trim()
+            ? String(body.device_id).trim().toLowerCase()
+            : null;
         const periodDays = parseInt(body.period_days, 10);
         const note = body.note ? String(body.note).trim().slice(0, 200) : '';
-
-        if (!deviceId) {
-            return sendJson(res, 400, { success: false, message: 'Target Device ID is required. Every token must be pre-set for a device.' });
-        }
         if (!PERIODS.includes(periodDays)) {
             return sendJson(res, 400, { success: false, message: 'Invalid subscription period' });
         }

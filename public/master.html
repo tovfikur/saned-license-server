@@ -166,8 +166,8 @@
           <form id="gen-form">
             <div class="form-grid">
               <div class="field span-2">
-                <label for="device-id-input">Target Device ID *</label>
-                <input type="text" id="device-id-input" placeholder="e.g. cf4ade3f1edec2c7" required style="font-family:monospace;">
+                <label for="device-id-input">Target Device ID <span class="muted" style="font-weight:normal;">(Optional - leave empty for auto-bind on first activation)</span></label>
+                <input type="text" id="device-id-input" placeholder="Leave empty for dynamic first-device binding" style="font-family:monospace;">
               </div>
               <div class="field">
                 <label for="period-select">Subscription Period</label>
@@ -574,7 +574,7 @@ function renderTokens() {
     const canRevoke = t.status === 'active' || t.status === 'available';
     return '<tr>' +
       '<td><span class="token-box">' + esc(t.token) + '</span></td>' +
-      '<td><span class="device-box">' + esc(t.deviceId) + '</span></td>' +
+      '<td>' + (t.deviceId ? '<span class="device-box">' + esc(t.deviceId) + '</span>' : '<span class="device-box unassigned-box" title="Device will be automatically bound during the first successful activation.">Unassigned (auto-bind)</span>') + '</td>' +
       '<td>' + t.periodDays + ' Days</td>' +
       '<td>' + esc(t.ownerName) + '</td>' +
       '<td><span class="status-tag status-' + esc(t.status) + '">' + esc(t.status) + '</span></td>' +
@@ -733,18 +733,14 @@ document.getElementById('gen-form').addEventListener('submit', async function (e
   const note = document.getElementById('note-input').value.trim();
   const resellerId = document.getElementById('owner-select').value;
 
-  if (!deviceId) {
-    toast('Please enter the target Device ID', 'error');
-    return;
-  }
-
   try {
-    const payload = { device_id: deviceId, period_days: periodDays, note: note };
+    const payload = { period_days: periodDays, note: note };
+    if (deviceId) payload.device_id = deviceId;
     if (resellerId) payload.reseller_id = resellerId;
     const data = await api('/api/tokens/generate', { method: 'POST', body: JSON.stringify(payload) });
     document.getElementById('device-id-input').value = '';
     document.getElementById('note-input').value = '';
-    toast('Token ' + data.token.token + ' created for ' + deviceId, 'success');
+    toast('Token ' + data.token.token + ' created' + (deviceId ? ' for ' + deviceId : ' (Unassigned / Auto-bind)'), 'success');
     await refresh();
   } catch (err) {
     toast(err.message, 'error');
