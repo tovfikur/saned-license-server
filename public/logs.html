@@ -264,6 +264,90 @@ pre { margin: 0; white-space: pre-wrap; word-break: break-word; color: #cbd5e1; 
   padding: 4rem 1rem;
   color: var(--muted);
 }
+
+/* Group By Order & View Toggles */
+.btn-toggle {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 0.8rem;
+  font-weight: 600;
+  padding: 0.35rem 0.75rem;
+  border-radius: 7px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  transition: all 0.15s ease;
+  user-select: none;
+}
+.btn-toggle:hover {
+  border-color: var(--primary);
+  color: var(--text);
+}
+.btn-toggle.active {
+  background: var(--primary);
+  border-color: var(--primary);
+  color: white;
+  box-shadow: 0 0 10px rgba(99, 102, 241, 0.4);
+}
+
+.order-group-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  margin-bottom: 0.9rem;
+  padding: 0.9rem 1.1rem;
+  transition: all 0.2s ease;
+}
+.order-group-card:hover {
+  border-color: rgba(99, 102, 241, 0.4);
+}
+.order-group-card.status-accepted { border-left: 4px solid var(--success); }
+.order-group-card.status-failed { border-left: 4px solid var(--danger); }
+.order-group-card.status-repaired { border-left: 4px solid #38bdf8; }
+.order-group-card.status-received { border-left: 4px solid #a78bfa; }
+.order-group-card.status-general { border-left: 4px solid var(--border); }
+
+.order-group-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  padding-bottom: 0.65rem;
+  border-bottom: 1px solid var(--border);
+}
+.order-timeline {
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+  margin-top: 0.75rem;
+  padding-left: 0.9rem;
+  border-left: 2px solid var(--border);
+}
+.order-step-node {
+  position: relative;
+  padding-left: 0.75rem;
+  font-size: 0.83rem;
+  line-height: 1.4;
+}
+.order-step-node::before {
+  content: '';
+  position: absolute;
+  left: -1.25rem;
+  top: 0.35rem;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--muted);
+  border: 2px solid var(--bg);
+}
+.order-step-node.node-success::before { background: var(--success); }
+.order-step-node.node-danger::before { background: var(--danger); }
+.order-step-node.node-repaired::before { background: #38bdf8; }
+.order-step-node.node-order::before { background: #a78bfa; }
+.order-step-node.node-eval::before { background: var(--warning); }
 </style>
 </head>
 <body>
@@ -317,6 +401,12 @@ pre { margin: 0; white-space: pre-wrap; word-break: break-word; color: #cbd5e1; 
       <option value="250">Last 250</option>
       <option value="500">Last 500</option>
     </select>
+    <button class="btn-toggle" id="toggle-orders-only" onclick="toggleOrdersOnly()" title="Show only dispatch orders">
+      📦 Orders Only
+    </button>
+    <button class="btn-toggle" id="toggle-group-orders" onclick="toggleGroupOrders()" title="Group logs by Order ID">
+      🗂️ Group by Order
+    </button>
     <button class="btn-sm" id="active-order-filter-btn" style="display:none;" onclick="clearOrderFilter()">
       <span id="active-order-label">Filter: Order #</span> ✕
     </button>
@@ -340,6 +430,22 @@ let isPaused = false;
 let expandedLogIds = new Set();
 let selectedOrderId = null;
 let pollInterval = null;
+let ordersOnly = false;
+let groupByOrder = false;
+
+function toggleOrdersOnly() {
+  ordersOnly = !ordersOnly;
+  const btn = document.getElementById('toggle-orders-only');
+  btn.classList.toggle('active', ordersOnly);
+  renderLogs();
+}
+
+function toggleGroupOrders() {
+  groupByOrder = !groupByOrder;
+  const btn = document.getElementById('toggle-group-orders');
+  btn.classList.toggle('active', groupByOrder);
+  renderLogs();
+}
 
 async function fetchLogs() {
   if (isPaused) return;
@@ -493,6 +599,9 @@ function renderLogs() {
   const tagFilter = (document.getElementById('filter-tag').value || '').trim().toUpperCase();
 
   let filtered = allLogs;
+  if (ordersOnly) {
+    filtered = filtered.filter(l => l.orderId > 0 || l.tag === 'ORDER_RECEIVED' || l.tag === 'ORDER_EVALUATION' || l.tag === 'ACCEPT_REQUEST' || l.tag === 'ACCEPT_SUCCESS' || l.tag === 'ACCEPT_FAILED' || l.tag === 'FAILOVER_REPAIRED' || (l.tag === 'UI_FEEDBACK' && l.orderId > 0));
+  }
   if (selectedOrderId) {
     filtered = filtered.filter(l => String(l.orderId) === selectedOrderId);
   }
@@ -507,6 +616,11 @@ function renderLogs() {
              (l.error && l.error.toLowerCase().includes(search)) ||
              (l.responseBody && l.responseBody.toLowerCase().includes(search));
     });
+  }
+
+  if (groupByOrder) {
+    renderGroupedOrders(filtered, container);
+    return;
   }
 
   if (filtered.length === 0) {
@@ -601,6 +715,130 @@ function renderLogs() {
   if (document.getElementById('auto-scroll').checked && !isPaused) {
     container.scrollTop = 0;
   }
+}
+
+function renderGroupedOrders(logs, container) {
+  const groups = new Map();
+  const orderList = [];
+
+  for (const log of logs) {
+    const oId = log.orderId > 0 ? String(log.orderId) : 'system';
+    if (!groups.has(oId)) {
+      groups.set(oId, []);
+      orderList.push(oId);
+    }
+    groups.get(oId).push(log);
+  }
+
+  if (orderList.length === 0) {
+    container.innerHTML = `
+      <div class="empty-state">
+        <div style="font-size:1.5rem; margin-bottom:0.5rem;">📦</div>
+        <div>No orders found matching your filters.</div>
+      </div>
+    `;
+    return;
+  }
+
+  let html = '';
+  for (const oId of orderList) {
+    const evs = groups.get(oId);
+    evs.sort((a, b) => (a.timestamp || a.receivedAt) - (b.timestamp || b.receivedAt));
+
+    const latest = evs[evs.length - 1];
+    const devId = evs[0].deviceId || latest.deviceId || 'Unknown';
+    const latestTime = new Date(latest.timestamp || latest.receivedAt).toLocaleTimeString();
+
+    let statusLabel = 'RECEIVED 📥';
+    let statusPillClass = 'badge-tag';
+    let cardStatusClass = 'status-received';
+
+    const hasSuccess = evs.some(e => (e.httpCode >= 200 && e.httpCode < 300) || e.tag === 'ACCEPT_SUCCESS');
+    const hasFail = evs.some(e => e.tag === 'ACCEPT_FAILED' || (e.tag === 'UI_FEEDBACK' && e.responseBody && e.responseBody.includes('Accept failed')));
+    const hasRepaired = evs.some(e => e.tag === 'FAILOVER_REPAIRED');
+    const hasEval = evs.some(e => e.tag === 'ORDER_EVALUATION');
+
+    if (hasSuccess) {
+      statusLabel = 'ACCEPTED ✅';
+      statusPillClass = 'badge-tag ACCEPT_SUCCESS';
+      cardStatusClass = 'status-accepted';
+    } else if (hasFail) {
+      statusLabel = 'ACCEPT FAILED ❌';
+      statusPillClass = 'badge-tag ACCEPT_FAILED';
+      cardStatusClass = 'status-failed';
+    } else if (hasRepaired) {
+      statusLabel = 'FAILOVER REPAIRED 🛡️';
+      statusPillClass = 'badge-tag FAILOVER_REPAIRED';
+      cardStatusClass = 'status-repaired';
+    } else if (hasEval) {
+      const evalLog = evs.find(e => e.tag === 'ORDER_EVALUATION');
+      const pass = evalLog.responseBody && evalLog.responseBody.includes('PASSED');
+      statusLabel = pass ? 'RULES PASSED ⚖️' : 'RULES REJECTED ⚠️';
+      statusPillClass = pass ? 'badge-tag ACCEPT_SUCCESS' : 'badge-tag TOKEN_MISSING';
+      cardStatusClass = pass ? 'status-accepted' : 'status-failed';
+    } else if (oId === 'system') {
+      statusLabel = 'SYSTEM / LOGCAT 📜';
+      statusPillClass = 'badge-tag LOGCAT';
+      cardStatusClass = 'status-general';
+    }
+
+    const isGroupExpanded = expandedLogIds.has('grp-' + oId);
+
+    html += `
+      <div class="order-group-card ${cardStatusClass}" id="grp-card-${oId}">
+        <div class="order-group-header">
+          <div style="display:flex; align-items:center; gap:0.6rem; flex-wrap:wrap;">
+            <span style="font-size:1.05rem; font-weight:800; color:var(--text);">
+              ${oId === 'system' ? 'System / Background Events' : 'Order #' + oId}
+            </span>
+            <span class="${statusPillClass}">${statusLabel}</span>
+            <span class="badge-tag">Dev: ${escapeHtml(devId)}</span>
+            <span class="badge-tag">${evs.length} event${evs.length > 1 ? 's' : ''}</span>
+          </div>
+          <div class="log-time">Latest: ${latestTime}</div>
+        </div>
+
+        <div class="order-timeline">
+          ${evs.map(e => {
+            const tagInfo = getTagDisplay(e.tag);
+            const t = new Date(e.timestamp || e.receivedAt).toLocaleTimeString();
+            let nodeClass = 'order-step-node';
+            if (e.tag === 'ACCEPT_SUCCESS' || (e.httpCode >= 200 && e.httpCode < 300)) nodeClass += ' node-success';
+            else if (e.tag === 'ACCEPT_FAILED' || (e.tag === 'UI_FEEDBACK' && e.responseBody && e.responseBody.includes('Accept failed'))) nodeClass += ' node-danger';
+            else if (e.tag === 'FAILOVER_REPAIRED') nodeClass += ' node-repaired';
+            else if (e.tag === 'ORDER_RECEIVED') nodeClass += ' node-order';
+            else if (e.tag === 'ORDER_EVALUATION') nodeClass += ' node-eval';
+
+            return `
+              <div class="${nodeClass}">
+                <div style="display:flex; align-items:center; gap:0.4rem; flex-wrap:wrap;">
+                  <span style="font-weight:700; color:var(--text);">${tagInfo.icon} ${tagInfo.label}</span>
+                  ${e.httpCode ? `<span class="badge-code ${e.httpCode >= 200 && e.httpCode < 300 ? 'code-200' : 'code-400'}">HTTP ${e.httpCode}</span>` : ''}
+                  <span class="log-time">${t}</span>
+                </div>
+                ${e.url ? `<div class="log-url-row" style="margin-top:0.25rem;"><span class="log-method">${escapeHtml(e.method || 'GET')}</span> <span>${escapeHtml(e.url)}</span></div>` : ''}
+                ${e.responseBody ? `<div style="font-size:0.8rem; color:${e.responseBody.includes('Accept failed') ? 'var(--danger)' : 'var(--muted)'}; margin-top:0.2rem; word-break:break-word;">${escapeHtml(e.responseBody.length > 200 ? e.responseBody.substring(0, 200) + '...' : e.responseBody)}</div>` : ''}
+                ${e.error ? `<div style="color:var(--danger); font-size:0.8rem; margin-top:0.2rem;">⚠️ ${escapeHtml(e.error)}</div>` : ''}
+              </div>
+            `;
+          }).join('')}
+        </div>
+
+        <div class="log-details-toggle" style="margin-top:0.6rem;">
+          <button class="toggle-btn" onclick="toggleExpand('grp-${oId}')">
+            ${isGroupExpanded ? '▲ Hide Raw Logs' : '▼ View All ' + evs.length + ' Raw JSON Logs for Order #' + oId}
+          </button>
+          ${oId !== 'system' ? `<button class="btn-sm" onclick="filterByOrder(${oId})" style="font-size:0.75rem; padding:0.15rem 0.45rem;">Isolate Order #${oId}</button>` : ''}
+        </div>
+
+        <div class="log-expanded-content ${isGroupExpanded ? 'show' : ''}" id="expand-grp-${oId}">
+          <pre>${escapeHtml(JSON.stringify(evs, null, 2))}</pre>
+        </div>
+      </div>
+    `;
+  }
+
+  container.innerHTML = html;
 }
 
 // Start polling every 2 seconds
