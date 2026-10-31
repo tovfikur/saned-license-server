@@ -501,21 +501,21 @@ function updateStats(serverTotal) {
   const total = allLogs.length;
   let success = 0;
   let failed = 0;
-  let orders = 0;
+  const distinctOrders = new Set();
   for (const l of allLogs) {
     if (l.httpCode >= 200 && l.httpCode < 300) {
       success++;
     } else if (l.httpCode > 0 || l.tag === 'ACCEPT_FAILED') {
       failed++;
     }
-    if (l.tag === 'ORDER_RECEIVED' || l.tag === 'ORDER_EVALUATION' || l.orderId > 0) {
-      orders++;
+    if (l.orderId > 0) {
+      distinctOrders.add(l.orderId);
     }
   }
   document.getElementById('stat-total').innerText = (serverTotal && serverTotal > total ? serverTotal + ' in 36hr (' + total + ' shown)' : total + ' events');
   document.getElementById('stat-success').innerText = success + ' ok';
   document.getElementById('stat-failed').innerText = failed + ' failed';
-  document.getElementById('stat-orders').innerText = orders + ' order events';
+  document.getElementById('stat-orders').innerText = distinctOrders.size + ' distinct orders';
 }
 
 function filterByOrder(orderId) {
