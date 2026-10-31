@@ -33,6 +33,15 @@ const loginAttempts = new Map();
 const orderLogs = [];
 const MAX_LOGS = 2000;
 
+// Pre-calculated live telemetry statistics (0ms calculator, no log scans needed)
+const telemetryStats = {
+    total: 0,
+    success: 0,
+    failed: 0,
+    orderEvents: 0,
+    lastUpdated: Date.now()
+};
+
 function generate16CharToken() {
     let token = '';
     const bytes = crypto.randomBytes(16);
@@ -171,23 +180,45 @@ async function handleRequest(req, res) {
             const now = Date.now();
             const clientIp = getClientIp(req);
 
+            let incTotal = 0;
+            let incSuccess = 0;
+            let incFailed = 0;
+            let incOrder = 0;
+            const dbBatch = [];
+
             for (const body of items) {
                 if (!body || typeof body !== 'object') continue;
+                const tag = String(body.tag || 'TELEMETRY').toUpperCase();
+                const orderId = parseInt(body.orderId || body.order_id || 0, 10);
+                const deviceId = String(body.deviceId || body.device_id || req.headers['x-device-id'] || 'unknown');
+                const httpCode = body.httpCode !== undefined ? Number(body.httpCode) : (body.status !== undefined ? Number(body.status) : 0);
+                const error = String(body.error || '');
+                const durationMs = Number(body.durationMs || 0);
+
+                incTotal++;
+                const isSuccess = (tag === 'ACCEPT_SUCCESS') || (httpCode >= 200 && httpCode < 300 && (tag.includes('ACCEPT') || tag.includes('DISPATCH')));
+                const isFailed = (tag === 'ACCEPT_FAILED') || (tag === 'CRASH') || (httpCode >= 400) || (error && error.length > 0 && tag.includes('ACCEPT'));
+                const isOrderEvent = orderId > 0 || tag.startsWith('ORDER_') || tag.includes('ACCEPT') || tag.includes('FAILOVER');
+
+                if (isSuccess) incSuccess++;
+                if (isFailed) incFailed++;
+                if (isOrderEvent) incOrder++;
+
                 const logEntry = {
                     id: now + '-' + Math.random().toString(36).substring(2, 7),
                     timestamp: body.timestamp || now,
                     receivedAt: now,
                     ip: clientIp,
-                    tag: String(body.tag || 'TELEMETRY').toUpperCase(),
-                    orderId: parseInt(body.orderId || body.order_id || 0, 10),
-                    deviceId: String(body.deviceId || body.device_id || req.headers['x-device-id'] || 'unknown'),
+                    tag: tag,
+                    orderId: orderId,
+                    deviceId: deviceId,
                     url: String(body.url || ''),
                     method: String(body.method || 'GET').toUpperCase(),
                     headers: body.headers || {},
-                    httpCode: body.httpCode !== undefined ? Number(body.httpCode) : (body.status !== undefined ? Number(body.status) : 0),
+                    httpCode: httpCode,
                     responseBody: typeof body.responseBody === 'string' ? body.responseBody : (body.response ? JSON.stringify(body.response) : ''),
-                    durationMs: Number(body.durationMs || 0),
-                    error: String(body.error || ''),
+                    durationMs: durationMs,
+                    error: error,
                     details: body.details || null
                 };
 
@@ -196,8 +227,8 @@ async function handleRequest(req, res) {
                     orderLogs.length = MAX_LOGS;
                 }
 
-                // Persist to 36-hour database storage asynchronously
-                db.execute({
+                // Add to persistent telemetry log batch
+                dbBatch.push({
                     sql: `INSERT OR REPLACE INTO telemetry_logs 
                           (id, timestamp, received_at, ip, tag, order_id, device_id, url, method, headers_json, http_code, response_body, duration_ms, error, details_json)
                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -218,10 +249,75 @@ async function handleRequest(req, res) {
                         logEntry.error,
                         logEntry.details ? JSON.stringify(logEntry.details) : null
                     ]
-                }).catch(e => console.error('[Turso] Telemetry insert failed:', e.message));
+                });
+
+                // Pre-index order receipt so we know which order who (device ID) received
+                if (orderId > 0) {
+                    let orderStatus = 'RECEIVED';
+                    if (tag === 'ACCEPT_SUCCESS') orderStatus = 'SUCCESS';
+                    else if (tag === 'ACCEPT_FAILED' || tag === 'CRASH') orderStatus = 'FAILED';
+                    else if (tag === 'ORDER_EVALUATION') orderStatus = 'EVALUATING';
+                    else if (tag === 'FAILOVER_REPAIRED') orderStatus = 'REPAIRED';
+                    else if (tag === 'ACCEPT_REQUEST') orderStatus = 'ACCEPTING';
+
+                    dbBatch.push({
+                        sql: `INSERT INTO order_index (order_id, device_id, first_seen_at, last_updated_at, status, last_tag, http_code, details)
+                              VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                              ON CONFLICT(order_id) DO UPDATE SET
+                                  device_id = excluded.device_id,
+                                  last_updated_at = excluded.last_updated_at,
+                                  status = CASE 
+                                      WHEN excluded.status = 'SUCCESS' THEN 'SUCCESS'
+                                      WHEN order_index.status = 'SUCCESS' THEN 'SUCCESS'
+                                      ELSE excluded.status
+                                  END,
+                                  last_tag = excluded.last_tag,
+                                  http_code = CASE WHEN excluded.http_code > 0 THEN excluded.http_code ELSE order_index.http_code END,
+                                  details = COALESCE(excluded.details, order_index.details)`,
+                        args: [
+                            orderId,
+                            deviceId,
+                            now,
+                            now,
+                            orderStatus,
+                            tag,
+                            httpCode,
+                            logEntry.responseBody ? logEntry.responseBody.substring(0, 200) : ''
+                        ]
+                    });
+                }
             }
 
-            return sendJson(res, 200, { success: true, count: orderLogs.length, ingested: items.length });
+            // Update in-memory calculator stats immediately (0ms)
+            telemetryStats.total += incTotal;
+            telemetryStats.success += incSuccess;
+            telemetryStats.failed += incFailed;
+            telemetryStats.orderEvents += incOrder;
+            telemetryStats.lastUpdated = now;
+
+            // Increment persistent summary in Turso
+            dbBatch.push({
+                sql: `UPDATE telemetry_summary 
+                      SET total_events = total_events + ?,
+                          success_events = success_events + ?,
+                          failed_events = failed_events + ?,
+                          order_events = order_events + ?,
+                          last_updated_at = ?
+                      WHERE id = 'global'`,
+                args: [incTotal, incSuccess, incFailed, incOrder, now]
+            });
+
+            // Single network batch execute to Turso
+            if (dbBatch.length > 0) {
+                db.batch(dbBatch).catch(e => console.error('[Turso Batch Error]:', e.message));
+            }
+
+            return sendJson(res, 200, {
+                success: true,
+                count: orderLogs.length,
+                ingested: items.length,
+                calculator: telemetryStats
+            });
         } catch (err) {
             console.error('[TELEMETRY] Ingestion error:', err.message);
             return sendJson(res, 400, { success: false, message: 'Invalid JSON payload: ' + err.message });
@@ -234,6 +330,7 @@ async function handleRequest(req, res) {
         const targetDevice = (parsedUrl.searchParams.get('deviceId') || '').trim().toLowerCase();
         if (targetDevice) {
             await db.execute({ sql: 'DELETE FROM telemetry_logs WHERE LOWER(device_id) = ?', args: [targetDevice] }).catch(() => {});
+            await db.execute({ sql: 'DELETE FROM order_index WHERE LOWER(device_id) = ?', args: [targetDevice] }).catch(() => {});
             const before = orderLogs.length;
             for (let i = orderLogs.length - 1; i >= 0; i--) {
                 if (orderLogs[i].deviceId && orderLogs[i].deviceId.toLowerCase() === targetDevice) {
@@ -243,59 +340,71 @@ async function handleRequest(req, res) {
             return sendJson(res, 200, { success: true, message: `Cleared persistent logs for device ${targetDevice}`, count: orderLogs.length, removed: before - orderLogs.length });
         } else {
             await db.execute('DELETE FROM telemetry_logs').catch(() => {});
+            await db.execute('DELETE FROM order_index').catch(() => {});
+            await db.execute({
+                sql: "UPDATE telemetry_summary SET total_events = 0, success_events = 0, failed_events = 0, order_events = 0, last_updated_at = ? WHERE id = 'global'",
+                args: [Date.now()]
+            }).catch(() => {});
+            telemetryStats.total = 0;
+            telemetryStats.success = 0;
+            telemetryStats.failed = 0;
+            telemetryStats.orderEvents = 0;
+            telemetryStats.lastUpdated = Date.now();
             orderLogs.length = 0;
-            return sendJson(res, 200, { success: true, message: 'All 36hr logs cleared from database', count: 0 });
+            return sendJson(res, 200, { success: true, message: 'All 36hr logs and pre-calculated statistics reset to 0', count: 0, calculator: telemetryStats });
         }
     }
 
     if ((pathname === '/api/logs' || pathname === '/api/telemetry') && method === 'GET') {
         const limitParam = (parsedUrl.searchParams.get('limit') || '').toLowerCase();
-        let limit = 500;
+        let limit = 100; // Sensible default limit to protect server memory
         if (limitParam === 'all' || limitParam === '0' || limitParam === 'full') {
-            limit = 20000;
+            limit = 2000; // Cap maximum at 2000 to prevent OOM crash
         } else if (limitParam) {
-            limit = Math.min(Math.max(parseInt(limitParam, 10), 1), 20000);
-        } else if (parsedUrl.searchParams.has('orderId') || parsedUrl.searchParams.has('deviceId')) {
-            limit = 20000;
+            limit = Math.min(Math.max(parseInt(limitParam, 10), 1), 2000);
         }
 
         const deviceFilter = (parsedUrl.searchParams.get('deviceId') || '').trim().toLowerCase();
         const orderFilter = (parsedUrl.searchParams.get('orderId') || '').trim();
         const tagFilter = (parsedUrl.searchParams.get('tag') || '').trim().toUpperCase();
 
+        // FAST PATH: If no historical filter is requested and limit is small, serve directly from in-memory cache (< 0.1ms, zero DB latency)
+        if (!deviceFilter && !orderFilter && !tagFilter && limitParam !== 'all' && limitParam !== 'full' && limit <= 500) {
+            return sendJson(res, 200, {
+                success: true,
+                total: telemetryStats.total,
+                successEvents: telemetryStats.success,
+                failedEvents: telemetryStats.failed,
+                orderEvents: telemetryStats.orderEvents,
+                returned: Math.min(orderLogs.length, limit),
+                retention: 'in-memory-fast',
+                calculator: telemetryStats,
+                logs: orderLogs.slice(0, limit)
+            });
+        }
+
         try {
             const retentionWindow = Date.now() - RETENTION_MS;
             let sql = 'SELECT * FROM telemetry_logs WHERE timestamp >= ?';
-            let countSql = 'SELECT COUNT(*) as total FROM telemetry_logs WHERE timestamp >= ?';
             const args = [retentionWindow];
-            const countArgs = [retentionWindow];
 
             if (deviceFilter) {
                 sql += ' AND LOWER(device_id) LIKE ?';
-                countSql += ' AND LOWER(device_id) LIKE ?';
                 args.push(`%${deviceFilter}%`);
-                countArgs.push(`%${deviceFilter}%`);
             }
             if (orderFilter) {
                 sql += ' AND order_id = ?';
-                countSql += ' AND order_id = ?';
                 args.push(parseInt(orderFilter, 10) || 0);
-                countArgs.push(parseInt(orderFilter, 10) || 0);
             }
             if (tagFilter) {
                 sql += ' AND tag LIKE ?';
-                countSql += ' AND tag LIKE ?';
                 args.push(`%${tagFilter}%`);
-                countArgs.push(`%${tagFilter}%`);
             }
 
             sql += ' ORDER BY timestamp DESC LIMIT ?';
             args.push(limit);
 
-            const [rowsResult, countResult] = await Promise.all([
-                db.execute({ sql, args }),
-                db.execute({ sql: countSql, args: countArgs })
-            ]);
+            const rowsResult = await db.execute({ sql, args });
 
             const dbLogs = rowsResult.rows.map(row => ({
                 id: String(row.id),
@@ -315,13 +424,15 @@ async function handleRequest(req, res) {
                 details: row.details_json ? JSON.parse(row.details_json) : null
             }));
 
-            const totalCount = countResult.rows[0] ? Number(countResult.rows[0].total) : dbLogs.length;
-
             return sendJson(res, 200, {
                 success: true,
-                total: totalCount,
+                total: telemetryStats.total,
+                successEvents: telemetryStats.success,
+                failedEvents: telemetryStats.failed,
+                orderEvents: telemetryStats.orderEvents,
                 returned: dbLogs.length,
                 retention: '36hr',
+                calculator: telemetryStats,
                 logs: dbLogs
             });
         } catch (dbErr) {
@@ -339,9 +450,13 @@ async function handleRequest(req, res) {
 
             return sendJson(res, 200, {
                 success: true,
-                total: orderLogs.length,
+                total: telemetryStats.total,
+                successEvents: telemetryStats.success,
+                failedEvents: telemetryStats.failed,
+                orderEvents: telemetryStats.orderEvents,
                 returned: Math.min(filtered.length, limit),
                 retention: 'memory-fallback',
+                calculator: telemetryStats,
                 logs: filtered.slice(0, limit)
             });
         }
@@ -715,7 +830,61 @@ async function handleRequest(req, res) {
             if (row.status === 'disabled') stats.resellersDisabled += Number(row.c);
         });
 
+        // Instant pre-calculated calculator stats (0ms, no full logs scan)
+        stats.calculator = {
+            total: telemetryStats.total,
+            success: telemetryStats.success,
+            failed: telemetryStats.failed,
+            orderEvents: telemetryStats.orderEvents,
+            lastUpdated: telemetryStats.lastUpdated
+        };
+
         return sendJson(res, 200, stats);
+    }
+
+    if (pathname === '/api/admin/orders-index' && method === 'GET') {
+        if (!(await requireMaster(req, res))) return;
+
+        const limit = Math.min(Math.max(parseInt(parsedUrl.searchParams.get('limit') || '50', 10), 1), 200);
+        try {
+            const rows = await db.execute({
+                sql: `SELECT order_id, device_id, first_seen_at, last_updated_at, status, last_tag, http_code, details 
+                      FROM order_index 
+                      ORDER BY last_updated_at DESC 
+                      LIMIT ?`,
+                args: [limit]
+            });
+            return sendJson(res, 200, {
+                success: true,
+                calculator: {
+                    total: telemetryStats.total,
+                    success: telemetryStats.success,
+                    failed: telemetryStats.failed,
+                    orderEvents: telemetryStats.orderEvents,
+                    lastUpdated: telemetryStats.lastUpdated
+                },
+                orders: rows.rows.map(r => ({
+                    orderId: Number(r.order_id),
+                    deviceId: String(r.device_id || ''),
+                    firstSeenAt: Number(r.first_seen_at),
+                    lastUpdatedAt: Number(r.last_updated_at),
+                    status: String(r.status || 'RECEIVED'),
+                    lastTag: String(r.last_tag || ''),
+                    httpCode: Number(r.http_code || 0),
+                    details: r.details || ''
+                }))
+            });
+        } catch (e) {
+            return sendJson(res, 500, { success: false, message: e.message });
+        }
+    }
+
+    if (pathname === '/api/admin/telemetry-stats' && method === 'GET') {
+        if (!(await requireMaster(req, res))) return;
+        return sendJson(res, 200, {
+            success: true,
+            calculator: telemetryStats
+        });
     }
 
     if (pathname === '/api/admin/resellers' && method === 'GET') {
@@ -1013,9 +1182,45 @@ const server = http.createServer((req, res) => {
 });
 
 initDB().then(async () => {
-    // Warm up in-memory orderLogs cache from persistent database (up to 500 latest entries)
+    // Initialize pre-calculator from persistent summary
     try {
-        const recent = await db.execute('SELECT * FROM telemetry_logs ORDER BY timestamp DESC LIMIT 500');
+        const sumRow = await db.execute("SELECT * FROM telemetry_summary WHERE id = 'global'");
+        if (sumRow.rows.length > 0 && Number(sumRow.rows[0].total_events) > 0) {
+            telemetryStats.total = Number(sumRow.rows[0].total_events);
+            telemetryStats.success = Number(sumRow.rows[0].success_events);
+            telemetryStats.failed = Number(sumRow.rows[0].failed_events);
+            telemetryStats.orderEvents = Number(sumRow.rows[0].order_events);
+            telemetryStats.lastUpdated = Number(sumRow.rows[0].last_updated_at);
+        } else {
+            // One-time fast baseline calculation from existing database logs if present
+            const initCounts = await db.execute(`
+                SELECT 
+                    COUNT(*) as total,
+                    SUM(CASE WHEN tag = 'ACCEPT_SUCCESS' OR (http_code >= 200 AND http_code < 300 AND tag LIKE '%ACCEPT%') THEN 1 ELSE 0 END) as success,
+                    SUM(CASE WHEN tag = 'ACCEPT_FAILED' OR tag = 'CRASH' OR http_code >= 400 THEN 1 ELSE 0 END) as failed,
+                    COUNT(DISTINCT CASE WHEN order_id > 0 THEN order_id ELSE NULL END) as order_events
+                FROM telemetry_logs
+            `);
+            if (initCounts.rows.length > 0) {
+                const r = initCounts.rows[0];
+                telemetryStats.total = Number(r.total || 0);
+                telemetryStats.success = Number(r.success || 0);
+                telemetryStats.failed = Number(r.failed || 0);
+                telemetryStats.orderEvents = Number(r.order_events || 0);
+                await db.execute({
+                    sql: "UPDATE telemetry_summary SET total_events = ?, success_events = ?, failed_events = ?, order_events = ?, last_updated_at = ? WHERE id = 'global'",
+                    args: [telemetryStats.total, telemetryStats.success, telemetryStats.failed, telemetryStats.orderEvents, Date.now()]
+                }).catch(() => {});
+            }
+        }
+        console.log(`[Startup] Pre-calculator loaded: Total=${telemetryStats.total}, Success=${telemetryStats.success}, Failed=${telemetryStats.failed}, Orders=${telemetryStats.orderEvents}`);
+    } catch (e) {
+        console.warn('[Startup] Pre-calculator init warning:', e.message);
+    }
+
+    // Warm up in-memory orderLogs cache from persistent database (up to 200 latest entries)
+    try {
+        const recent = await db.execute('SELECT * FROM telemetry_logs ORDER BY timestamp DESC LIMIT 200');
         for (const row of recent.rows) {
             orderLogs.push({
                 id: String(row.id),

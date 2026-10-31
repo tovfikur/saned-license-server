@@ -106,6 +106,98 @@
         </div>
       </div>
 
+      <!-- Real-time Dispatch Telemetry Pre-Calculator -->
+      <div class="card" style="margin-top: 1.5rem; border-top: 3px solid var(--primary);">
+        <div class="card-head" style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:1rem;">
+          <div>
+            <div class="card-title" style="display:flex; align-items:center; gap:0.6rem;">
+              <span class="status-dot" style="background:#22c55e; box-shadow:0 0 8px #22c55e;"></span>
+              Dispatch Pre-Calculator & Order Receipt Index
+            </div>
+            <div class="card-desc">Zero-query instant calculator showing order events and which device ID received each order.</div>
+          </div>
+          <div style="display:flex; align-items:center; gap:0.6rem;">
+            <a href="/logs" class="btn-ghost" target="_blank" style="text-decoration:none; display:inline-flex; align-items:center; gap:0.4rem; font-size:0.82rem; padding:0.4rem 0.8rem;">
+              <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+              Live Telemetry Console
+            </a>
+            <button class="btn-ghost" onclick="fetchOrderIndex()" title="Refresh index" style="font-size:0.82rem; padding:0.4rem 0.8rem;">
+              ↻ Refresh
+            </button>
+            <button class="btn-ghost" onclick="resetCalculator()" title="Reset calculator to 0" style="color:var(--danger); font-size:0.82rem; padding:0.4rem 0.8rem;">
+              Reset to 0
+            </button>
+          </div>
+        </div>
+
+        <div class="stats-grid" style="margin-bottom: 1.25rem;">
+          <div class="stat-card">
+            <div class="stat-icon info">
+              <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg>
+            </div>
+            <div>
+              <div class="stat-label">Total Events</div>
+              <div class="stat-value" id="calc-total" style="color:var(--info);">0</div>
+            </div>
+          </div>
+
+          <div class="stat-card">
+            <div class="stat-icon success">
+              <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M20 6 9 17l-5-5"/></svg>
+            </div>
+            <div>
+              <div class="stat-label">Success</div>
+              <div class="stat-value" id="calc-success" style="color:var(--success);">0</div>
+            </div>
+          </div>
+
+          <div class="stat-card">
+            <div class="stat-icon danger">
+              <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><path d="m15 9-6 6M9 9l6 6"/></svg>
+            </div>
+            <div>
+              <div class="stat-label">Failed</div>
+              <div class="stat-value" id="calc-failed" style="color:var(--danger);">0</div>
+            </div>
+          </div>
+
+          <div class="stat-card">
+            <div class="stat-icon violet">
+              <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="m9 12 2 2 4-4"/></svg>
+            </div>
+            <div>
+              <div class="stat-label">Order Events</div>
+              <div class="stat-value" id="calc-orders" style="color:#a78bfa;">0</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Order Receipt Index -->
+        <div style="margin-top:1rem;">
+          <div style="font-size:0.88rem; font-weight:600; margin-bottom:0.6rem; color:var(--text); display:flex; align-items:center; justify-content:space-between;">
+            <span>Live Order Receipt Index (Which Device Received Which Order)</span>
+            <span id="order-index-count" class="pill" style="font-size:0.75rem;">0 orders indexed</span>
+          </div>
+          <div class="table-wrap" style="max-height: 320px; overflow-y: auto;">
+            <table>
+              <thead>
+                <tr>
+                  <th>Order ID</th>
+                  <th>Received By (Device ID)</th>
+                  <th>Status</th>
+                  <th>Last Tag</th>
+                  <th>HTTP Code</th>
+                  <th>Last Updated</th>
+                </tr>
+              </thead>
+              <tbody id="order-index-tbody">
+                <tr><td colspan="6" style="text-align:center; color:var(--muted); padding:1.5rem;">No orders recorded yet</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
       <div class="grid-2">
         <div class="card">
           <div class="card-head">
@@ -476,6 +568,7 @@ async function refresh() {
   renderOwnerOptions();
   renderResellers();
   renderTokens();
+  fetchOrderIndex().catch(function () {});
 }
 
 function renderStats() {
@@ -488,6 +581,12 @@ function renderStats() {
   document.getElementById('stat-resellers').textContent = s.resellers || 0;
   document.getElementById('reseller-count').textContent = (s.resellers || 0) + ' accounts';
   document.getElementById('license-count').textContent = (s.total || 0) + ' tokens';
+
+  const calc = s.calculator || { total: 0, success: 0, failed: 0, orderEvents: 0 };
+  document.getElementById('calc-total').textContent = calc.total || 0;
+  document.getElementById('calc-success').textContent = calc.success || 0;
+  document.getElementById('calc-failed').textContent = calc.failed || 0;
+  document.getElementById('calc-orders').textContent = calc.orderEvents || 0;
 }
 
 function renderOwnerOptions() {
@@ -810,11 +909,69 @@ document.getElementById('quota-modal').addEventListener('click', function (event
   document.getElementById(id).addEventListener('change', renderTokens);
 });
 
+async function fetchOrderIndex() {
+  try {
+    const data = await api('/api/admin/orders-index?limit=50');
+    if (data.calculator) {
+      document.getElementById('calc-total').textContent = data.calculator.total || 0;
+      document.getElementById('calc-success').textContent = data.calculator.success || 0;
+      document.getElementById('calc-failed').textContent = data.calculator.failed || 0;
+      document.getElementById('calc-orders').textContent = data.calculator.orderEvents || 0;
+    }
+    const tbody = document.getElementById('order-index-tbody');
+    const orders = data.orders || [];
+    document.getElementById('order-index-count').textContent = orders.length + ' orders indexed';
+    if (orders.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="6" style="text-align:center; color:var(--muted); padding:1.5rem;">No orders recorded yet</td></tr>';
+      return;
+    }
+    tbody.innerHTML = orders.map(function (o) {
+      let badgeClass = 'pill';
+      if (o.status === 'SUCCESS') badgeClass = 'pill pill-cloud';
+      else if (o.status === 'FAILED') badgeClass = 'pill pill-danger';
+      else if (o.status === 'ACCEPTING') badgeClass = 'pill pill-warning';
+      else if (o.status === 'RECEIVED') badgeClass = 'pill pill-reseller';
+
+      const timeStr = o.lastUpdatedAt ? new Date(o.lastUpdatedAt).toLocaleTimeString() : '-';
+      const shortDev = (o.deviceId && o.deviceId.length > 16) 
+        ? (o.deviceId.substring(0, 8) + '...' + o.deviceId.substring(o.deviceId.length - 6)) 
+        : (o.deviceId || 'unknown');
+
+      return '<tr>' +
+        '<td style="font-family:monospace; font-weight:700; color:var(--text);">' + esc(o.orderId) + '</td>' +
+        '<td style="font-family:monospace;" title="' + esc(o.deviceId) + '">' + esc(shortDev) + '</td>' +
+        '<td><span class="' + badgeClass + '" style="font-size:0.75rem; text-transform:uppercase;">' + esc(o.status) + '</span></td>' +
+        '<td style="font-size:0.8rem; color:var(--muted);">' + esc(o.lastTag) + '</td>' +
+        '<td style="font-family:monospace;">' + (o.httpCode > 0 ? o.httpCode : '-') + '</td>' +
+        '<td style="font-size:0.8rem; color:var(--muted);">' + esc(timeStr) + '</td>' +
+      '</tr>';
+    }).join('');
+  } catch (err) {
+    console.warn('[OrderIndex] Fetch error:', err);
+  }
+}
+
+async function resetCalculator() {
+  if (!confirm('Are you sure you want to reset the pre-calculator counters to 0?')) return;
+  try {
+    const data = await api('/api/logs/clear', { method: 'DELETE' });
+    document.getElementById('calc-total').textContent = '0';
+    document.getElementById('calc-success').textContent = '0';
+    document.getElementById('calc-failed').textContent = '0';
+    document.getElementById('calc-orders').textContent = '0';
+    toast('Calculator reset to 0', 'success');
+    await fetchOrderIndex();
+  } catch (e) {
+    toast('Reset failed: ' + e.message, 'error');
+  }
+}
+
 init().catch(function (err) {
   console.error(err);
   toast(err.message, 'error');
 });
 setInterval(function () { refresh().catch(function () {}); }, 15000);
+setInterval(function () { if (!document.hidden) fetchOrderIndex().catch(function () {}); }, 5000);
 </script>
 </body>
 </html>

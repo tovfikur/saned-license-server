@@ -398,11 +398,11 @@ pre { margin: 0; white-space: pre-wrap; word-break: break-word; color: #cbd5e1; 
       <option value="TOKEN_MISSING">⚠️ Token Issues</option>
     </select>
     <select id="filter-limit" class="filter-input" onchange="fetchLogs()">
-      <option value="all" selected>All (Full 36hr DB)</option>
-      <option value="1000">Last 1000</option>
-      <option value="500">Last 500</option>
-      <option value="250">Last 250</option>
-      <option value="100">Last 100</option>
+      <option value="100" selected>Recent 100 (Fast)</option>
+      <option value="250">Recent 250</option>
+      <option value="500">Recent 500</option>
+      <option value="1000">Recent 1000</option>
+      <option value="all">Full 36hr DB (Slow)</option>
     </select>
     <button class="btn-toggle" id="toggle-orders-only" onclick="toggleOrdersOnly()" title="Show only dispatch orders">
       📦 Orders Only
@@ -874,9 +874,13 @@ function renderGroupedOrders(logs, container) {
   container.innerHTML = html;
 }
 
-// Start polling every 2 seconds
+// Start polling every 5 seconds (pauses automatically if tab is hidden)
 fetchLogs();
-pollInterval = setInterval(fetchLogs, 2000);
+pollInterval = setInterval(function () {
+  if (!document.hidden && !isPaused) {
+    fetchLogs();
+  }
+}, 5000);
 </script>
 </body>
 </html>
