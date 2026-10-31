@@ -1,0 +1,499 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Live Telemetry & Logs - AWS PRO</title>
+<link rel="stylesheet" href="/styles.css">
+<style>
+.logs-container {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  overflow: hidden;
+}
+.logs-header {
+  padding: 1.25rem 2rem;
+  background: rgba(15, 23, 42, 0.95);
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 1rem;
+  flex-shrink: 0;
+}
+.logs-title-group {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+}
+.logs-title {
+  font-size: 1.25rem;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+.pulse-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--success);
+  box-shadow: 0 0 10px var(--success);
+  animation: pulse 2s infinite;
+}
+.pulse-dot.paused {
+  background: var(--warning);
+  box-shadow: 0 0 10px var(--warning);
+  animation: none;
+}
+@keyframes pulse {
+  0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.7); }
+  70% { transform: scale(1.1); box-shadow: 0 0 0 10px rgba(34, 197, 94, 0); }
+  100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(34, 197, 94, 0); }
+}
+.stats-badges {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+.stat-pill {
+  font-size: 0.78rem;
+  font-weight: 600;
+  padding: 0.3rem 0.7rem;
+  border-radius: 9999px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+}
+.stat-pill.success { color: var(--success); border-color: rgba(34, 197, 94, 0.3); }
+.stat-pill.danger { color: var(--danger); border-color: rgba(239, 68, 68, 0.3); }
+.stat-pill.info { color: var(--info); border-color: rgba(56, 189, 248, 0.3); }
+
+.filter-bar {
+  padding: 0.85rem 2rem;
+  background: rgba(11, 18, 32, 0.85);
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  flex-shrink: 0;
+}
+.filter-input {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 0.45rem 0.85rem;
+  border-radius: var(--radius-sm);
+  font-size: 0.85rem;
+}
+.filter-input:focus {
+  outline: none;
+  border-color: var(--primary);
+}
+.btn-sm {
+  padding: 0.45rem 0.9rem;
+  border-radius: var(--radius-sm);
+  font-size: 0.82rem;
+  font-weight: 600;
+  cursor: pointer;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text);
+  transition: all 0.2s;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+.btn-sm:hover { background: var(--surface-3); border-color: var(--border-strong); }
+.btn-sm.danger { color: var(--danger); border-color: rgba(239, 68, 68, 0.4); }
+.btn-sm.danger:hover { background: rgba(239, 68, 68, 0.15); }
+.btn-sm.primary { background: var(--primary); color: #fff; border-color: var(--primary); }
+.btn-sm.primary:hover { background: var(--primary-hover); }
+
+.logs-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 1.5rem 2rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.85rem;
+}
+.log-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 1rem 1.25rem;
+  transition: all 0.2s;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+}
+.log-card:hover {
+  border-color: var(--border-strong);
+}
+.log-card.card-success { border-left: 4px solid var(--success); }
+.log-card.card-danger { border-left: 4px solid var(--danger); background: rgba(239, 68, 68, 0.03); }
+.log-card.card-warning { border-left: 4px solid var(--warning); }
+.log-card.card-info { border-left: 4px solid var(--info); }
+
+.log-meta-line {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-bottom: 0.5rem;
+}
+.log-tags {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+.badge-code {
+  font-weight: 700;
+  font-size: 0.8rem;
+  padding: 0.2rem 0.55rem;
+  border-radius: 6px;
+}
+.badge-code.code-200 { background: var(--success-soft); color: var(--success); }
+.badge-code.code-400 { background: var(--danger-soft); color: var(--danger); }
+.badge-code.code-0 { background: rgba(239, 68, 68, 0.2); color: #fca5a5; }
+
+.badge-tag {
+  font-size: 0.75rem;
+  font-weight: 600;
+  padding: 0.2rem 0.55rem;
+  border-radius: 6px;
+  background: var(--surface-2);
+  color: var(--muted);
+  border: 1px solid var(--border);
+}
+.badge-tag.ACCEPT_SUCCESS { background: var(--success-soft); color: var(--success); }
+.badge-tag.ACCEPT_FAILED { background: var(--danger-soft); color: var(--danger); }
+.badge-tag.ACCEPT_REQUEST { background: var(--info-soft); color: var(--info); }
+.badge-tag.TOKEN_MISSING { background: var(--warning-soft); color: var(--warning); }
+
+.log-order-id {
+  font-size: 1rem;
+  font-weight: 700;
+  color: var(--text);
+}
+.log-time {
+  font-size: 0.78rem;
+  color: var(--muted-2);
+}
+.log-url-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-family: monospace;
+  font-size: 0.83rem;
+  word-break: break-all;
+  color: var(--muted);
+  margin-top: 0.3rem;
+}
+.log-method {
+  font-weight: 700;
+  color: var(--primary);
+}
+.log-duration {
+  font-size: 0.75rem;
+  color: var(--muted-2);
+  margin-left: auto;
+}
+.log-details-toggle {
+  margin-top: 0.75rem;
+  padding-top: 0.6rem;
+  border-top: 1px dashed var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.toggle-btn {
+  background: none;
+  border: none;
+  color: var(--primary);
+  font-size: 0.8rem;
+  cursor: pointer;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+}
+.toggle-btn:hover { text-decoration: underline; }
+.log-expanded-content {
+  display: none;
+  margin-top: 0.75rem;
+  padding: 0.75rem;
+  background: #060911;
+  border-radius: 6px;
+  border: 1px solid rgba(255,255,255,0.06);
+  font-family: monospace;
+  font-size: 0.78rem;
+  overflow-x: auto;
+}
+.log-expanded-content.show { display: block; }
+.json-key { color: #38bdf8; }
+.json-val { color: #4ade80; }
+.json-err { color: #f87171; }
+.empty-state {
+  text-align: center;
+  padding: 4rem 1rem;
+  color: var(--muted);
+}
+</style>
+</head>
+<body>
+<div class="logs-container">
+  <header class="logs-header">
+    <div class="logs-title-group">
+      <div class="pulse-dot" id="live-indicator"></div>
+      <div class="logs-title">
+        <span>AWS PRO — Dispatch Telemetry</span>
+      </div>
+      <div class="stats-badges">
+        <span class="stat-pill info" id="stat-total">0 total</span>
+        <span class="stat-pill success" id="stat-success">0 success</span>
+        <span class="stat-pill danger" id="stat-failed">0 failed</span>
+      </div>
+    </div>
+    <div style="display:flex; align-items:center; gap:0.6rem;">
+      <a href="/master" class="btn-sm">
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="3" width="7" height="7" rx="1.6"/><rect x="14" y="3" width="7" height="7" rx="1.6"/><rect x="3" y="14" width="7" height="7" rx="1.6"/><rect x="14" y="14" width="7" height="7" rx="1.6"/></svg>
+        Master Panel
+      </a>
+      <button class="btn-sm" id="pause-btn" onclick="togglePause()">
+        <span id="pause-text">Pause</span>
+      </button>
+      <button class="btn-sm danger" onclick="clearLogs()">
+        Clear Logs
+      </button>
+    </div>
+  </header>
+
+  <div class="filter-bar">
+    <input type="text" id="filter-search" class="filter-input" placeholder="Search (order #, device, error...)" oninput="renderLogs()">
+    <select id="filter-tag" class="filter-input" onchange="renderLogs()">
+      <option value="">All Events</option>
+      <option value="ACCEPT_SUCCESS">Success (2xx)</option>
+      <option value="ACCEPT_FAILED">Failed (4xx/5xx/0)</option>
+      <option value="ACCEPT_REQUEST">Accept Requests</option>
+      <option value="ORDER_RECEIVED">Order Received</option>
+      <option value="TOKEN_MISSING">Token Issues</option>
+    </select>
+    <select id="filter-limit" class="filter-input" onchange="fetchLogs()">
+      <option value="100">Last 100</option>
+      <option value="250">Last 250</option>
+      <option value="500">Last 500</option>
+    </select>
+    <label style="font-size:0.8rem; color:var(--muted); display:inline-flex; align-items:center; gap:0.4rem; margin-left:auto; cursor:pointer;">
+      <input type="checkbox" id="auto-scroll" checked> Auto-scroll to latest
+    </label>
+  </div>
+
+  <div class="logs-body" id="logs-list">
+    <div class="empty-state">
+      <div style="font-size:1.5rem; margin-bottom:0.5rem;">📡</div>
+      <div>Waiting for dispatch telemetry from remote devices...</div>
+      <div class="hint" style="margin-top:0.4rem;">Incoming order accepts, requests, HTTP codes, and gateway responses will appear here in real time.</div>
+    </div>
+  </div>
+</div>
+
+<script>
+let allLogs = [];
+let isPaused = false;
+let expandedLogIds = new Set();
+let pollInterval = null;
+
+async function fetchLogs() {
+  if (isPaused) return;
+  try {
+    const limit = document.getElementById('filter-limit').value || 100;
+    const res = await fetch('/api/logs?limit=' + limit);
+    if (!res.ok) return;
+    const data = await res.json();
+    if (data.success && Array.isArray(data.logs)) {
+      allLogs = data.logs;
+      updateStats();
+      renderLogs();
+    }
+  } catch (err) {
+    console.warn('[Telemetry] Poll failed:', err);
+  }
+}
+
+function updateStats() {
+  const total = allLogs.length;
+  let success = 0;
+  let failed = 0;
+  for (const l of allLogs) {
+    if (l.httpCode >= 200 && l.httpCode < 300) {
+      success++;
+    } else if (l.httpCode > 0 || l.tag === 'ACCEPT_FAILED') {
+      failed++;
+    }
+  }
+  document.getElementById('stat-total').innerText = total + ' events';
+  document.getElementById('stat-success').innerText = success + ' ok';
+  document.getElementById('stat-failed').innerText = failed + ' failed';
+}
+
+function togglePause() {
+  isPaused = !isPaused;
+  const btn = document.getElementById('pause-text');
+  const indicator = document.getElementById('live-indicator');
+  if (isPaused) {
+    btn.innerText = 'Resume';
+    indicator.classList.add('paused');
+  } else {
+    btn.innerText = 'Pause';
+    indicator.classList.remove('paused');
+    fetchLogs();
+  }
+}
+
+async function clearLogs() {
+  if (!confirm('Clear all in-memory telemetry logs on server?')) return;
+  try {
+    await fetch('/api/logs?clear=true');
+    allLogs = [];
+    updateStats();
+    renderLogs();
+  } catch (e) {
+    alert('Clear failed: ' + e.message);
+  }
+}
+
+function toggleExpand(id) {
+  if (expandedLogIds.has(id)) {
+    expandedLogIds.delete(id);
+  } else {
+    expandedLogIds.add(id);
+  }
+  const el = document.getElementById('expand-' + id);
+  if (el) {
+    el.classList.toggle('show');
+  }
+}
+
+function escapeHtml(str) {
+  if (!str) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function renderLogs() {
+  const container = document.getElementById('logs-list');
+  const search = (document.getElementById('filter-search').value || '').trim().toLowerCase();
+  const tagFilter = (document.getElementById('filter-tag').value || '').trim().toUpperCase();
+
+  let filtered = allLogs;
+  if (tagFilter) {
+    filtered = filtered.filter(l => l.tag.includes(tagFilter) || (tagFilter === 'ACCEPT_SUCCESS' && l.httpCode >= 200 && l.httpCode < 300) || (tagFilter === 'ACCEPT_FAILED' && (l.httpCode >= 400 || l.httpCode === 0)));
+  }
+  if (search) {
+    filtered = filtered.filter(l => {
+      return (String(l.orderId).includes(search)) ||
+             (l.deviceId && l.deviceId.toLowerCase().includes(search)) ||
+             (l.url && l.url.toLowerCase().includes(search)) ||
+             (l.error && l.error.toLowerCase().includes(search)) ||
+             (l.responseBody && l.responseBody.toLowerCase().includes(search));
+    });
+  }
+
+  if (filtered.length === 0) {
+    container.innerHTML = `
+      <div class="empty-state">
+        <div style="font-size:1.5rem; margin-bottom:0.5rem;">🔍</div>
+        <div>No matching telemetry logs found.</div>
+      </div>
+    `;
+    return;
+  }
+
+  let html = '';
+  for (const log of filtered) {
+    const isSuccess = (log.httpCode >= 200 && log.httpCode < 300);
+    const isDanger = (log.httpCode >= 400 || log.httpCode === 0 || log.tag === 'ACCEPT_FAILED');
+    const isWarning = (log.tag === 'TOKEN_MISSING');
+    let cardClass = isSuccess ? 'card-success' : (isDanger ? 'card-danger' : (isWarning ? 'card-warning' : 'card-info'));
+
+    let codeBadge = '';
+    if (log.httpCode > 0) {
+      codeBadge = `<span class="badge-code ${isSuccess ? 'code-200' : 'code-400'}">HTTP ${log.httpCode}</span>`;
+    } else if (log.httpCode === 0 && log.tag.includes('ACCEPT')) {
+      codeBadge = `<span class="badge-code code-0">HTTP 0 (Aborted/Network)</span>`;
+    }
+
+    const timeStr = new Date(log.timestamp || log.receivedAt).toLocaleTimeString();
+    const isExpanded = expandedLogIds.has(log.id);
+
+    html += `
+      <div class="log-card ${cardClass}" id="card-${log.id}">
+        <div class="log-meta-line">
+          <div class="log-tags">
+            ${codeBadge}
+            <span class="badge-tag ${log.tag}">${escapeHtml(log.tag)}</span>
+            ${log.orderId > 0 ? `<span class="log-order-id">#${log.orderId}</span>` : ''}
+            <span class="badge-tag">Dev: ${escapeHtml(log.deviceId)}</span>
+          </div>
+          <div class="log-time">${timeStr} (${log.durationMs}ms)</div>
+        </div>
+
+        ${log.url ? `
+        <div class="log-url-row">
+          <span class="log-method">${escapeHtml(log.method || 'GET')}</span>
+          <span>${escapeHtml(log.url)}</span>
+        </div>` : ''}
+
+        ${log.error ? `
+        <div style="color:var(--danger); font-size:0.82rem; margin-top:0.35rem; font-weight:600;">
+          ⚠️ Error: ${escapeHtml(log.error)}
+        </div>` : ''}
+
+        ${log.responseBody ? `
+        <div style="font-size:0.8rem; color:var(--muted); margin-top:0.35rem; font-family:monospace; background:rgba(0,0,0,0.25); padding:0.4rem 0.6rem; border-radius:4px; max-height:60px; overflow:hidden; text-overflow:ellipsis;">
+          ${escapeHtml(log.responseBody)}
+        </div>` : ''}
+
+        <div class="log-details-toggle">
+          <button class="toggle-btn" onclick="toggleExpand('${log.id}')">
+            ${isExpanded ? '▲ Hide Full Payload & Headers' : '▼ View Request Headers & Full Response'}
+          </button>
+          <span style="font-size:0.75rem; color:var(--muted-2);">ID: ${log.id}</span>
+        </div>
+
+        <div class="log-expanded-content ${isExpanded ? 'show' : ''}" id="expand-${log.id}">
+          <div style="color:#a78bfa; font-weight:bold; margin-bottom:0.3rem;">[Request Headers]</div>
+          <pre>${escapeHtml(JSON.stringify(log.headers, null, 2))}</pre>
+
+          <div style="color:#38bdf8; font-weight:bold; margin-top:0.6rem; margin-bottom:0.3rem;">[Response Body]</div>
+          <pre>${escapeHtml(log.responseBody || '(empty response)')}</pre>
+
+          ${log.details ? `
+          <div style="color:#f59e0b; font-weight:bold; margin-top:0.6rem; margin-bottom:0.3rem;">[Diagnostic Details]</div>
+          <pre>${escapeHtml(JSON.stringify(log.details, null, 2))}</pre>` : ''}
+        </div>
+      </div>
+    `;
+  }
+
+  container.innerHTML = html;
+
+  if (document.getElementById('auto-scroll').checked && !isPaused) {
+    // Scroll to top because newest logs are at the top
+    container.scrollTop = 0;
+  }
+}
+
+// Start polling every 2 seconds
+fetchLogs();
+pollInterval = setInterval(fetchLogs, 2000);
+</script>
+</body>
+</html>

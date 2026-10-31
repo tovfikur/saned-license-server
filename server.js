@@ -29,6 +29,10 @@ const LOGIN_MAX_FAILURES = 5;
 const pageCache = new Map();
 const loginAttempts = new Map();
 
+// In-memory telemetry log buffer for remote device debugging (up to 2000 entries)
+const orderLogs = [];
+const MAX_LOGS = 2000;
+
 function generate16CharToken() {
     let token = '';
     const bytes = crypto.randomBytes(16);
@@ -143,7 +147,7 @@ async function handleRequest(req, res) {
     const pathname = parsedUrl.pathname;
     const method = req.method;
 
-    if (['/api/verify', '/api/activate', '/api/health', '/api/legacy/auth/login', '/api/legacy/auth/refresh'].includes(pathname)) {
+    if (['/api/verify', '/api/activate', '/api/health', '/api/logs', '/api/telemetry', '/api/legacy/auth/login', '/api/legacy/auth/refresh'].includes(pathname)) {
         res.setHeader('Access-Control-Allow-Origin', '*');
         res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
         res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-device-id, X-App-Version, X-App-Cert, X-Nonce');
@@ -157,6 +161,72 @@ async function handleRequest(req, res) {
 
     if (pathname === '/api/health' && method === 'GET') {
         return sendJson(res, 200, { status: 'ok', time: Date.now(), database: DB_MODE, dbSource: DB_SOURCE });
+    }
+
+    // ---------------------------------------------------------------- Telemetry / Logging API
+    if ((pathname === '/api/logs' || pathname === '/api/telemetry') && method === 'POST') {
+        try {
+            const body = await readJsonBody(req);
+            const now = Date.now();
+            const logEntry = {
+                id: now + '-' + Math.random().toString(36).substring(2, 7),
+                timestamp: body.timestamp || now,
+                receivedAt: now,
+                ip: getClientIp(req),
+                tag: String(body.tag || 'TELEMETRY').toUpperCase(),
+                orderId: parseInt(body.orderId || body.order_id || 0, 10),
+                deviceId: String(body.deviceId || body.device_id || req.headers['x-device-id'] || 'unknown'),
+                url: String(body.url || ''),
+                method: String(body.method || 'GET').toUpperCase(),
+                headers: body.headers || {},
+                httpCode: body.httpCode !== undefined ? Number(body.httpCode) : (body.status !== undefined ? Number(body.status) : 0),
+                responseBody: typeof body.responseBody === 'string' ? body.responseBody : (body.response ? JSON.stringify(body.response) : ''),
+                durationMs: Number(body.durationMs || 0),
+                error: String(body.error || ''),
+                details: body.details || null
+            };
+
+            orderLogs.unshift(logEntry);
+            if (orderLogs.length > MAX_LOGS) {
+                orderLogs.length = MAX_LOGS;
+            }
+
+            console.log(`[TELEMETRY] [${logEntry.tag}] Order #${logEntry.orderId} Code:${logEntry.httpCode} Dev:${logEntry.deviceId} Latency:${logEntry.durationMs}ms Err:${logEntry.error || 'none'}`);
+            return sendJson(res, 200, { success: true, count: orderLogs.length, id: logEntry.id });
+        } catch (err) {
+            console.error('[TELEMETRY] Ingestion error:', err.message);
+            return sendJson(res, 400, { success: false, message: 'Invalid JSON payload: ' + err.message });
+        }
+    }
+
+    if ((pathname === '/api/logs' || pathname === '/api/telemetry') && method === 'GET') {
+        if (parsedUrl.searchParams.get('clear') === 'true') {
+            orderLogs.length = 0;
+            return sendJson(res, 200, { success: true, message: 'Logs cleared', count: 0 });
+        }
+
+        const limit = Math.min(Math.max(parseInt(parsedUrl.searchParams.get('limit') || '100', 10), 1), 500);
+        const deviceFilter = (parsedUrl.searchParams.get('deviceId') || '').trim().toLowerCase();
+        const orderFilter = (parsedUrl.searchParams.get('orderId') || '').trim();
+        const tagFilter = (parsedUrl.searchParams.get('tag') || '').trim().toUpperCase();
+
+        let filtered = orderLogs;
+        if (deviceFilter) {
+            filtered = filtered.filter(l => l.deviceId.toLowerCase().includes(deviceFilter));
+        }
+        if (orderFilter) {
+            filtered = filtered.filter(l => String(l.orderId) === orderFilter);
+        }
+        if (tagFilter) {
+            filtered = filtered.filter(l => l.tag.includes(tagFilter));
+        }
+
+        return sendJson(res, 200, {
+            success: true,
+            total: orderLogs.length,
+            returned: Math.min(filtered.length, limit),
+            logs: filtered.slice(0, limit)
+        });
     }
 
     // ---------------------------------------------------------------- Legacy Adapter Routes
@@ -804,6 +874,10 @@ async function handleRequest(req, res) {
         if (!user) return redirect(res, '/login');
         if (user.role !== 'reseller') return redirect(res, '/master');
         return sendPage(res, 'reseller.html');
+    }
+
+    if (pathname === '/logs' && method === 'GET') {
+        return sendPage(res, 'logs.html');
     }
 
     sendJson(res, 404, { message: 'Not Found' });
