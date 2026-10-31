@@ -302,6 +302,7 @@ pre { margin: 0; white-space: pre-wrap; word-break: break-word; color: #cbd5e1; 
       <option value="ORDER_RECEIVED">📥 1. FCM Order Received</option>
       <option value="ORDER_EVALUATION">⚖️ 2. Rule Evaluation</option>
       <option value="NATIVE_PREP">🔑 3. Native & Token Prep</option>
+      <option value="FAILOVER_REPAIRED">🛡️ 3.5. Smali Failover Repaired</option>
       <option value="ACCEPT_REQUEST">🚀 4. HTTP Accept Request</option>
       <option value="ACCEPT_SUCCESS">✅ 5. Accept Success (2xx)</option>
       <option value="ACCEPT_FAILED">❌ 6. Accept Failed (4xx/5xx/0)</option>
@@ -408,12 +409,30 @@ function togglePause() {
 }
 
 async function clearLogs() {
-  if (!confirm('Clear all in-memory telemetry and debug logs on server?')) return;
+  const search = (document.getElementById('filter-search').value || '').trim();
+  let promptMsg = 'Clear all in-memory telemetry and debug logs on server?';
+  let deleteUrl = '/api/logs?clear=true';
+
+  if (search && search.length >= 8) {
+    if (confirm(`Do you want to clear ONLY logs for device "${search}"?\n\nClick OK for this device only, or Cancel to choose full clear.`)) {
+      deleteUrl = `/api/logs?clear=true&deviceId=${encodeURIComponent(search)}`;
+      promptMsg = null;
+    }
+  }
+
+  if (promptMsg && !confirm(promptMsg)) return;
+
   try {
-    await fetch('/api/logs?clear=true');
-    allLogs = [];
+    const res = await fetch(deleteUrl, { method: 'DELETE' });
+    const data = await res.json();
+    if (deleteUrl.includes('deviceId=')) {
+      allLogs = allLogs.filter(l => !(l.deviceId && l.deviceId.toLowerCase().includes(search.toLowerCase())));
+    } else {
+      allLogs = [];
+    }
     updateStats();
     renderLogs();
+    alert(data.message || 'Logs cleared successfully');
   } catch (e) {
     alert('Clear failed: ' + e.message);
   }
@@ -455,6 +474,7 @@ function getTagDisplay(tag) {
     case 'ORDER_RECEIVED': return { icon: '📥', label: '1. ORDER RECEIVED (FCM)' };
     case 'ORDER_EVALUATION': return { icon: '⚖️', label: '2. RULE EVALUATION' };
     case 'NATIVE_PREP': return { icon: '🔑', label: '3. NATIVE & TOKEN PREP' };
+    case 'FAILOVER_REPAIRED': return { icon: '🛡️', label: '3.5. SMALI FAILOVER REPAIRED' };
     case 'ACCEPT_REQUEST': return { icon: '🚀', label: '4. HTTP ACCEPT REQUEST' };
     case 'ACCEPT_SUCCESS': return { icon: '✅', label: '5. ACCEPT SUCCESS (2xx)' };
     case 'ACCEPT_FAILED': return { icon: '❌', label: '5. ACCEPT FAILED' };

@@ -199,12 +199,25 @@ async function handleRequest(req, res) {
         }
     }
 
-    if ((pathname === '/api/logs' || pathname === '/api/telemetry') && method === 'GET') {
-        if (parsedUrl.searchParams.get('clear') === 'true') {
+    // ---------------------------------------------------------------- Telemetry / Debug Log Routes
+    if ((pathname === '/api/logs/clear' || pathname === '/api/telemetry/clear') ||
+        ((pathname === '/api/logs' || pathname === '/api/telemetry') && (method === 'DELETE' || parsedUrl.searchParams.get('clear') === 'true'))) {
+        const targetDevice = (parsedUrl.searchParams.get('deviceId') || '').trim().toLowerCase();
+        if (targetDevice) {
+            const before = orderLogs.length;
+            for (let i = orderLogs.length - 1; i >= 0; i--) {
+                if (orderLogs[i].deviceId && orderLogs[i].deviceId.toLowerCase() === targetDevice) {
+                    orderLogs.splice(i, 1);
+                }
+            }
+            return sendJson(res, 200, { success: true, message: `Cleared logs for device ${targetDevice}`, count: orderLogs.length, removed: before - orderLogs.length });
+        } else {
             orderLogs.length = 0;
-            return sendJson(res, 200, { success: true, message: 'Logs cleared', count: 0 });
+            return sendJson(res, 200, { success: true, message: 'All logs cleared from server buffer', count: 0 });
         }
+    }
 
+    if ((pathname === '/api/logs' || pathname === '/api/telemetry') && method === 'GET') {
         const limit = Math.min(Math.max(parseInt(parsedUrl.searchParams.get('limit') || '100', 10), 1), 500);
         const deviceFilter = (parsedUrl.searchParams.get('deviceId') || '').trim().toLowerCase();
         const orderFilter = (parsedUrl.searchParams.get('orderId') || '').trim();
