@@ -166,57 +166,62 @@ async function handleRequest(req, res) {
     // ---------------------------------------------------------------- Telemetry / Logging API
     if ((pathname === '/api/logs' || pathname === '/api/telemetry') && method === 'POST') {
         try {
-            const body = await readJsonBody(req);
+            const rawBody = await readJsonBody(req);
+            const items = Array.isArray(rawBody) ? rawBody : (Array.isArray(rawBody.batch) ? rawBody.batch : [rawBody]);
             const now = Date.now();
-            const logEntry = {
-                id: now + '-' + Math.random().toString(36).substring(2, 7),
-                timestamp: body.timestamp || now,
-                receivedAt: now,
-                ip: getClientIp(req),
-                tag: String(body.tag || 'TELEMETRY').toUpperCase(),
-                orderId: parseInt(body.orderId || body.order_id || 0, 10),
-                deviceId: String(body.deviceId || body.device_id || req.headers['x-device-id'] || 'unknown'),
-                url: String(body.url || ''),
-                method: String(body.method || 'GET').toUpperCase(),
-                headers: body.headers || {},
-                httpCode: body.httpCode !== undefined ? Number(body.httpCode) : (body.status !== undefined ? Number(body.status) : 0),
-                responseBody: typeof body.responseBody === 'string' ? body.responseBody : (body.response ? JSON.stringify(body.response) : ''),
-                durationMs: Number(body.durationMs || 0),
-                error: String(body.error || ''),
-                details: body.details || null
-            };
+            const clientIp = getClientIp(req);
 
-            orderLogs.unshift(logEntry);
-            if (orderLogs.length > MAX_LOGS) {
-                orderLogs.length = MAX_LOGS;
+            for (const body of items) {
+                if (!body || typeof body !== 'object') continue;
+                const logEntry = {
+                    id: now + '-' + Math.random().toString(36).substring(2, 7),
+                    timestamp: body.timestamp || now,
+                    receivedAt: now,
+                    ip: clientIp,
+                    tag: String(body.tag || 'TELEMETRY').toUpperCase(),
+                    orderId: parseInt(body.orderId || body.order_id || 0, 10),
+                    deviceId: String(body.deviceId || body.device_id || req.headers['x-device-id'] || 'unknown'),
+                    url: String(body.url || ''),
+                    method: String(body.method || 'GET').toUpperCase(),
+                    headers: body.headers || {},
+                    httpCode: body.httpCode !== undefined ? Number(body.httpCode) : (body.status !== undefined ? Number(body.status) : 0),
+                    responseBody: typeof body.responseBody === 'string' ? body.responseBody : (body.response ? JSON.stringify(body.response) : ''),
+                    durationMs: Number(body.durationMs || 0),
+                    error: String(body.error || ''),
+                    details: body.details || null
+                };
+
+                orderLogs.unshift(logEntry);
+                if (orderLogs.length > MAX_LOGS) {
+                    orderLogs.length = MAX_LOGS;
+                }
+
+                // Persist to 36-hour database storage asynchronously
+                db.execute({
+                    sql: `INSERT OR REPLACE INTO telemetry_logs 
+                          (id, timestamp, received_at, ip, tag, order_id, device_id, url, method, headers_json, http_code, response_body, duration_ms, error, details_json)
+                          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                    args: [
+                        logEntry.id,
+                        logEntry.timestamp,
+                        logEntry.receivedAt,
+                        logEntry.ip,
+                        logEntry.tag,
+                        logEntry.orderId,
+                        logEntry.deviceId,
+                        logEntry.url,
+                        logEntry.method,
+                        logEntry.headers && Object.keys(logEntry.headers).length > 0 ? JSON.stringify(logEntry.headers) : null,
+                        logEntry.httpCode,
+                        logEntry.responseBody,
+                        logEntry.durationMs,
+                        logEntry.error,
+                        logEntry.details ? JSON.stringify(logEntry.details) : null
+                    ]
+                }).catch(e => console.error('[Turso] Telemetry insert failed:', e.message));
             }
 
-            // Persist to 36-hour database storage asynchronously
-            db.execute({
-                sql: `INSERT OR REPLACE INTO telemetry_logs 
-                      (id, timestamp, received_at, ip, tag, order_id, device_id, url, method, headers_json, http_code, response_body, duration_ms, error, details_json)
-                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                args: [
-                    logEntry.id,
-                    logEntry.timestamp,
-                    logEntry.receivedAt,
-                    logEntry.ip,
-                    logEntry.tag,
-                    logEntry.orderId,
-                    logEntry.deviceId,
-                    logEntry.url,
-                    logEntry.method,
-                    logEntry.headers && Object.keys(logEntry.headers).length > 0 ? JSON.stringify(logEntry.headers) : null,
-                    logEntry.httpCode,
-                    logEntry.responseBody,
-                    logEntry.durationMs,
-                    logEntry.error,
-                    logEntry.details ? JSON.stringify(logEntry.details) : null
-                ]
-            }).catch(e => console.error('[Turso] Telemetry insert failed:', e.message));
-
-            console.log(`[TELEMETRY] [${logEntry.tag}] Order #${logEntry.orderId} Code:${logEntry.httpCode} Dev:${logEntry.deviceId} Latency:${logEntry.durationMs}ms Err:${logEntry.error || 'none'}`);
-            return sendJson(res, 200, { success: true, count: orderLogs.length, id: logEntry.id });
+            return sendJson(res, 200, { success: true, count: orderLogs.length, ingested: items.length });
         } catch (err) {
             console.error('[TELEMETRY] Ingestion error:', err.message);
             return sendJson(res, 400, { success: false, message: 'Invalid JSON payload: ' + err.message });
