@@ -33,6 +33,32 @@ const loginAttempts = new Map();
 const orderLogs = [];
 const MAX_LOGS = 2000;
 
+// Device Security: Blocklist & Unverified ID tracking
+const blockedDevices = new Set();
+const unverifiedDevices = new Map(); // deviceId -> { deviceId, lastSeen, ip, lastTag, lastUrl, count }
+const verifiedDevicesCache = new Map(); // deviceId -> { verified: boolean, time: number }
+
+async function checkIsDeviceVerified(deviceId) {
+    if (!deviceId || deviceId === 'unknown' || deviceId === 'unknown-device') return false;
+    const devKey = deviceId.trim().toLowerCase();
+    if (blockedDevices.has(devKey)) return false;
+    const cached = verifiedDevicesCache.get(devKey);
+    if (cached && (Date.now() - cached.time < 60000)) {
+        return cached.verified;
+    }
+    try {
+        const res = await db.execute({
+            sql: "SELECT token FROM tokens WHERE LOWER(device_id) = ? AND status = 'active' LIMIT 1",
+            args: [devKey]
+        });
+        const verified = res.rows.length > 0;
+        verifiedDevicesCache.set(devKey, { verified, time: Date.now() });
+        return verified;
+    } catch {
+        return false;
+    }
+}
+
 // Pre-calculated live telemetry statistics (0ms calculator, no log scans needed)
 const telemetryStats = {
     total: 0,
@@ -168,8 +194,89 @@ async function handleRequest(req, res) {
         return;
     }
 
+    // Blocked Device Enforcement
+    const headerDev = (req.headers['x-device-id'] || '').trim().toLowerCase();
+    if (headerDev && blockedDevices.has(headerDev) && !pathname.startsWith('/api/devices/')) {
+        return sendJson(res, 403, { success: false, error: 'Device is blocked by administrator', blocked: true });
+    }
+
     if (pathname === '/api/health' && method === 'GET') {
         return sendJson(res, 200, { status: 'ok', time: Date.now(), database: DB_MODE, dbSource: DB_SOURCE });
+    }
+
+    // ---------------------------------------------------------------- Device Security & Blocklist Routes
+    if (pathname === '/api/devices/unverified' && method === 'GET') {
+        const list = Array.from(unverifiedDevices.values()).sort((a, b) => b.lastSeen - a.lastSeen);
+        return sendJson(res, 200, { success: true, count: list.length, unverified: list });
+    }
+
+    if (pathname === '/api/devices/blocked' && method === 'GET') {
+        try {
+            const rows = await db.execute('SELECT device_id, reason, blocked_at FROM blocked_devices ORDER BY blocked_at DESC');
+            return sendJson(res, 200, {
+                success: true,
+                count: rows.rows.length,
+                blocked: rows.rows.map(r => ({ deviceId: String(r.device_id), reason: r.reason || '', blockedAt: Number(r.blocked_at) }))
+            });
+        } catch (e) {
+            return sendJson(res, 200, { success: true, count: 0, blocked: [] });
+        }
+    }
+
+    if (pathname === '/api/devices/block' && method === 'POST') {
+        try {
+            const body = await readJsonBody(req);
+            const targetId = String(body.deviceId || body.device_id || '').trim();
+            const reason = String(body.reason || 'Blocked by administrator via Live Console').trim();
+            if (!targetId) {
+                return sendJson(res, 400, { success: false, error: 'Device ID is required' });
+            }
+
+            const targetKey = targetId.toLowerCase();
+            blockedDevices.add(targetKey);
+            unverifiedDevices.delete(targetKey);
+            verifiedDevicesCache.delete(targetKey);
+
+            await db.execute({
+                sql: 'INSERT OR REPLACE INTO blocked_devices (device_id, reason, blocked_at) VALUES (?, ?, ?)',
+                args: [targetId, reason, Date.now()]
+            });
+
+            // Automatically revoke any tokens linked to this device
+            await db.execute({
+                sql: "UPDATE tokens SET status = 'revoked', note = CASE WHEN note IS NULL OR note = '' THEN '[BLOCKED]' ELSE note || ' [BLOCKED]' END WHERE LOWER(device_id) = ?",
+                args: [targetKey]
+            }).catch(() => {});
+
+            console.log(`[Security] Blocked device: ${targetId} (Reason: ${reason})`);
+            return sendJson(res, 200, { success: true, message: `Device ${targetId} has been blocked immediately`, deviceId: targetId });
+        } catch (err) {
+            return sendJson(res, 500, { success: false, error: err.message });
+        }
+    }
+
+    if (pathname === '/api/devices/unblock' && method === 'POST') {
+        try {
+            const body = await readJsonBody(req);
+            const targetId = String(body.deviceId || body.device_id || '').trim();
+            if (!targetId) {
+                return sendJson(res, 400, { success: false, error: 'Device ID is required' });
+            }
+
+            const targetKey = targetId.toLowerCase();
+            blockedDevices.delete(targetKey);
+            verifiedDevicesCache.delete(targetKey);
+
+            await db.execute({
+                sql: 'DELETE FROM blocked_devices WHERE LOWER(device_id) = ?',
+                args: [targetKey]
+            });
+
+            console.log(`[Security] Unblocked device: ${targetId}`);
+            return sendJson(res, 200, { success: true, message: `Device ${targetId} unblocked`, deviceId: targetId });
+        } catch (err) {
+            return sendJson(res, 500, { success: false, error: err.message });
+        }
     }
 
     // ---------------------------------------------------------------- Telemetry / Logging API
@@ -191,6 +298,26 @@ async function handleRequest(req, res) {
                 const tag = String(body.tag || 'TELEMETRY').toUpperCase();
                 const orderId = parseInt(body.orderId || body.order_id || 0, 10);
                 const deviceId = String(body.deviceId || body.device_id || req.headers['x-device-id'] || 'unknown');
+                const devKey = deviceId.trim().toLowerCase();
+
+                // Drop logs from blocked devices
+                if (devKey && blockedDevices.has(devKey)) {
+                    continue;
+                }
+
+                const isVerified = await checkIsDeviceVerified(deviceId);
+                if (!isVerified && deviceId !== 'unknown' && deviceId !== 'unknown-device') {
+                    const existingUnverified = unverifiedDevices.get(devKey);
+                    unverifiedDevices.set(devKey, {
+                        deviceId: deviceId,
+                        lastSeen: now,
+                        ip: clientIp,
+                        lastTag: tag,
+                        lastUrl: String(body.url || ''),
+                        count: (existingUnverified ? existingUnverified.count + 1 : 1)
+                    });
+                }
+
                 const httpCode = body.httpCode !== undefined ? Number(body.httpCode) : (body.status !== undefined ? Number(body.status) : 0);
                 const error = String(body.error || '');
                 const durationMs = Number(body.durationMs || 0);
@@ -212,6 +339,7 @@ async function handleRequest(req, res) {
                     tag: tag,
                     orderId: orderId,
                     deviceId: deviceId,
+                    unverified: !isVerified,
                     url: String(body.url || ''),
                     method: String(body.method || 'GET').toUpperCase(),
                     headers: body.headers || {},
@@ -1216,6 +1344,17 @@ initDB().then(async () => {
         console.log(`[Startup] Pre-calculator loaded: Total=${telemetryStats.total}, Success=${telemetryStats.success}, Failed=${telemetryStats.failed}, Orders=${telemetryStats.orderEvents}`);
     } catch (e) {
         console.warn('[Startup] Pre-calculator init warning:', e.message);
+    }
+
+    // Load blocked devices into memory set
+    try {
+        const bRows = await db.execute('SELECT device_id FROM blocked_devices');
+        for (const row of bRows.rows) {
+            if (row.device_id) blockedDevices.add(String(row.device_id).toLowerCase());
+        }
+        console.log(`[Startup] Loaded ${blockedDevices.size} blocked devices into memory`);
+    } catch (e) {
+        console.warn('[Startup] Could not load blocked devices:', e.message);
     }
 
     // Warm up in-memory orderLogs cache from persistent database (up to 200 latest entries)
