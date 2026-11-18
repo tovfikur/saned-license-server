@@ -37,6 +37,74 @@ const loginAttempts = new Map();
 const orderLogs = [];
 const MAX_LOGS = 2000;
 
+// Telemetry Reduction Settings (prevents flooding Turso SQLite database)
+const REDUCE_TELEMETRY_LOGS = process.env.REDUCE_TELEMETRY_LOGS !== 'false';
+const PERSIST_RAW_LOGS = process.env.PERSIST_RAW_LOGS === 'true';
+
+// Coalesced Async DB Batch Queue
+let pendingDbBatch = [];
+let dbFlushTimer = null;
+let pendingSummary = { total: 0, success: 0, failed: 0, order: 0 };
+let summaryFlushTimer = null;
+
+function queueDbOperation(op, immediate = false) {
+    pendingDbBatch.push(op);
+    if (immediate || DB_MODE === 'local-file' || pendingDbBatch.length >= 25) {
+        if (dbFlushTimer) {
+            clearTimeout(dbFlushTimer);
+            dbFlushTimer = null;
+        }
+        return flushDbQueue();
+    } else if (!dbFlushTimer) {
+        dbFlushTimer = setTimeout(flushDbQueue, 1500);
+    }
+}
+
+async function flushDbQueue() {
+    dbFlushTimer = null;
+    if (pendingDbBatch.length === 0) return;
+    const batch = pendingDbBatch.splice(0, 50);
+    try {
+        await db.batch(batch);
+    } catch (err) {
+        console.error('[Turso Batch Flush Error]:', err.message);
+    }
+}
+
+function queueSummaryIncrement(incTotal, incSuccess, incFailed, incOrder) {
+    pendingSummary.total += incTotal;
+    pendingSummary.success += incSuccess;
+    pendingSummary.failed += incFailed;
+    pendingSummary.order += incOrder;
+
+    if (!summaryFlushTimer) {
+        summaryFlushTimer = setTimeout(flushSummaryToDb, 5000);
+    }
+}
+
+async function flushSummaryToDb() {
+    summaryFlushTimer = null;
+    if (pendingSummary.total === 0 && pendingSummary.success === 0 && pendingSummary.failed === 0 && pendingSummary.order === 0) {
+        return;
+    }
+    const inc = { ...pendingSummary };
+    pendingSummary = { total: 0, success: 0, failed: 0, order: 0 };
+    try {
+        await db.execute({
+            sql: `UPDATE telemetry_summary 
+                  SET total_events = total_events + ?,
+                      success_events = success_events + ?,
+                      failed_events = failed_events + ?,
+                      order_events = order_events + ?,
+                      last_updated_at = ?
+                  WHERE id = 'global'`,
+            args: [inc.total, inc.success, inc.failed, inc.order, Date.now()]
+        });
+    } catch (err) {
+        console.error('[Turso Summary Flush Error]:', err.message);
+    }
+}
+
 // Device Security: Blocklist & Unverified ID tracking
 const blockedDevices = new Set();
 const unverifiedDevices = new Map(); // deviceId -> { deviceId, lastSeen, ip, lastTag, lastUrl, count }
@@ -418,29 +486,39 @@ async function handleRequest(req, res) {
                     orderLogs.length = MAX_LOGS;
                 }
 
-                // Add to persistent telemetry log batch
-                dbBatch.push({
-                    sql: `INSERT OR REPLACE INTO telemetry_logs 
-                          (id, timestamp, received_at, ip, tag, order_id, device_id, url, method, headers_json, http_code, response_body, duration_ms, error, details_json)
-                          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                    args: [
-                        logEntry.id,
-                        logEntry.timestamp,
-                        logEntry.receivedAt,
-                        logEntry.ip,
-                        logEntry.tag,
-                        logEntry.orderId,
-                        logEntry.deviceId,
-                        logEntry.url,
-                        logEntry.method,
-                        logEntry.headers && Object.keys(logEntry.headers).length > 0 ? JSON.stringify(logEntry.headers) : null,
-                        logEntry.httpCode,
-                        logEntry.responseBody,
-                        logEntry.durationMs,
-                        logEntry.error,
-                        logEntry.details ? JSON.stringify(logEntry.details) : null
-                    ]
-                });
+                // Decide whether to persist raw log to database
+                // If PERSIST_RAW_LOGS is false (default), skip raw logs to save database bandwidth & RAM.
+                // If enabled or non-reduced, only persist important order/error logs (skip spam like ORDER_RECEIVED/UI_FEEDBACK)
+                const shouldPersistLog = PERSIST_RAW_LOGS || (!REDUCE_TELEMETRY_LOGS && (isOrderEvent || isFailed || orderId > 0));
+
+                if (shouldPersistLog) {
+                    const safeUrl = String(logEntry.url || '').substring(0, 255);
+                    const safeResp = logEntry.responseBody ? String(logEntry.responseBody).substring(0, 200) : '';
+                    const safeDetails = logEntry.details ? JSON.stringify(logEntry.details).substring(0, 200) : null;
+
+                    queueDbOperation({
+                        sql: `INSERT OR REPLACE INTO telemetry_logs 
+                              (id, timestamp, received_at, ip, tag, order_id, device_id, url, method, headers_json, http_code, response_body, duration_ms, error, details_json)
+                              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                        args: [
+                            logEntry.id,
+                            logEntry.timestamp,
+                            logEntry.receivedAt,
+                            logEntry.ip,
+                            logEntry.tag,
+                            logEntry.orderId,
+                            logEntry.deviceId,
+                            safeUrl,
+                            logEntry.method,
+                            null,
+                            logEntry.httpCode,
+                            safeResp,
+                            logEntry.durationMs,
+                            logEntry.error ? String(logEntry.error).substring(0, 200) : '',
+                            safeDetails
+                        ]
+                    }, true);
+                }
 
                 // Pre-index order receipt so we know which order who (device ID) received
                 if (orderId > 0) {
@@ -451,7 +529,7 @@ async function handleRequest(req, res) {
                     else if (tag === 'FAILOVER_REPAIRED') orderStatus = 'REPAIRED';
                     else if (tag === 'ACCEPT_REQUEST') orderStatus = 'ACCEPTING';
 
-                    dbBatch.push({
+                    queueDbOperation({
                         sql: `INSERT INTO order_index (order_id, device_id, first_seen_at, last_updated_at, status, last_tag, http_code, details)
                               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                               ON CONFLICT(order_id) DO UPDATE SET
@@ -475,7 +553,7 @@ async function handleRequest(req, res) {
                             httpCode,
                             logEntry.responseBody ? logEntry.responseBody.substring(0, 200) : ''
                         ]
-                    });
+                    }, true);
                 }
             }
 
@@ -486,22 +564,8 @@ async function handleRequest(req, res) {
             telemetryStats.orderEvents += incOrder;
             telemetryStats.lastUpdated = now;
 
-            // Increment persistent summary in Turso
-            dbBatch.push({
-                sql: `UPDATE telemetry_summary 
-                      SET total_events = total_events + ?,
-                          success_events = success_events + ?,
-                          failed_events = failed_events + ?,
-                          order_events = order_events + ?,
-                          last_updated_at = ?
-                      WHERE id = 'global'`,
-                args: [incTotal, incSuccess, incFailed, incOrder, now]
-            });
-
-            // Single network batch execute to Turso
-            if (dbBatch.length > 0) {
-                db.batch(dbBatch).catch(e => console.error('[Turso Batch Error]:', e.message));
-            }
+            // Debounced update to telemetry_summary in Turso (flushes every 5s instead of on every hit)
+            queueSummaryIncrement(incTotal, incSuccess, incFailed, incOrder);
 
             return sendJson(res, 200, {
                 success: true,
