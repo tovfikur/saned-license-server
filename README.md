@@ -14,11 +14,11 @@ License management server for Saned Assistant with a **Master panel** and **Rese
 ## Environment variables
 | Variable | Required | Description |
 |---|---|---|
-| `TURSO_DATABASE_URL` | Production | Turso database URL (`libsql://...`). Falls back to `file:./local.db` for local dev. |
-| `TURSO_AUTH_TOKEN` | Production | Turso auth token. |
+| `TURSO_DATABASE_URL` | Optional | Turso / libSQL database URL (e.g. `http://151.158.51.11:8085` or `libsql://...`). |
+| `TURSO_AUTH_TOKEN` | Optional | Turso auth token / Ed25519 JWT bearer token. |
 | `MASTER_USERNAME` | Optional | Master username created on first run (default `master`). |
 | `MASTER_PASSWORD` | Optional | Master password on first run. If omitted, a random password is generated and printed once in the logs. |
-| `PORT` | Optional | HTTP port (Render sets this automatically). |
+| `PORT` | Optional | HTTP port (default 8888; Render sets this automatically). |
 | `RENDER_EXTERNAL_URL` | Optional | Used by the keep-alive ping. |
 
 > Never commit Turso credentials. Rotate any token that was previously committed to git.

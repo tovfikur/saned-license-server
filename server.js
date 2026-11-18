@@ -1,3 +1,7 @@
+if (typeof process.loadEnvFile === 'function') {
+    try { process.loadEnvFile(); } catch (_) {}
+}
+
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
@@ -272,8 +276,67 @@ async function handleRequest(req, res) {
                 args: [targetKey]
             });
 
+            // Restore any tokens linked to this device that were marked revoked or blocked
+            try {
+                const devTokens = await db.execute({
+                    sql: "SELECT token, activated_at, expires_at, note, status FROM tokens WHERE LOWER(device_id) = ?",
+                    args: [targetKey]
+                });
+                const now = Date.now();
+                for (const row of devTokens.rows) {
+                    if ((row.note && row.note.includes('[BLOCKED]')) || row.status === 'revoked') {
+                        const cleanNote = (row.note || '').replace(/\s*\[BLOCKED\]/g, '').trim();
+                        let newStatus = row.status;
+                        if (row.status === 'revoked') {
+                            if (row.activated_at) {
+                                newStatus = (row.expires_at && now > Number(row.expires_at)) ? 'expired' : 'active';
+                            } else {
+                                newStatus = 'available';
+                            }
+                        }
+                        await db.execute({
+                            sql: 'UPDATE tokens SET status = ?, note = ? WHERE token = ?',
+                            args: [newStatus, cleanNote, row.token]
+                        });
+                    }
+                }
+            } catch (_) {}
+
             console.log(`[Security] Unblocked device: ${targetId}`);
-            return sendJson(res, 200, { success: true, message: `Device ${targetId} unblocked`, deviceId: targetId });
+            return sendJson(res, 200, { success: true, message: `Device ${targetId} unblocked and licenses restored`, deviceId: targetId });
+        } catch (err) {
+            return sendJson(res, 500, { success: false, error: err.message });
+        }
+    }
+
+    if (pathname === '/api/devices/unblock-all' && method === 'POST') {
+        try {
+            blockedDevices.clear();
+            verifiedDevicesCache.clear();
+
+            await db.execute('DELETE FROM blocked_devices');
+
+            // Restore all tokens that were revoked or marked with [BLOCKED]
+            const blockedTokens = await db.execute("SELECT token, activated_at, expires_at, note, status FROM tokens WHERE note LIKE '%[BLOCKED]%' OR status = 'revoked'");
+            const now = Date.now();
+            for (const row of blockedTokens.rows) {
+                const cleanNote = (row.note || '').replace(/\s*\[BLOCKED\]/g, '').trim();
+                let newStatus = row.status;
+                if (row.status === 'revoked') {
+                    if (row.activated_at) {
+                        newStatus = (row.expires_at && now > Number(row.expires_at)) ? 'expired' : 'active';
+                    } else {
+                        newStatus = 'available';
+                    }
+                }
+                await db.execute({
+                    sql: 'UPDATE tokens SET status = ?, note = ? WHERE token = ?',
+                    args: [newStatus, cleanNote, row.token]
+                });
+            }
+
+            console.log('[Security] Unblocked ALL devices and restored licenses');
+            return sendJson(res, 200, { success: true, message: 'All devices have been unblocked and licenses restored' });
         } catch (err) {
             return sendJson(res, 500, { success: false, error: err.message });
         }

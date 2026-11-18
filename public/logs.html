@@ -1034,6 +1034,26 @@ async function unblockDevice(deviceId) {
   }
 }
 
+async function unblockAllDevices() {
+  if (!confirm('Are you sure you want to unblock ALL devices and restore all licenses?')) return;
+  try {
+    const res = await fetch('/api/devices/unblock-all', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' }
+    });
+    const data = await res.json();
+    if (data.success) {
+      alert('All devices have been unblocked!');
+      fetchSecurityStats();
+      openBlockedModal();
+    } else {
+      alert('Unblock all failed: ' + (data.error || 'Unknown error'));
+    }
+  } catch (e) {
+    alert('Unblock all error: ' + e.message);
+  }
+}
+
 // Start polling every 5 seconds (pauses automatically if tab is hidden)
 fetchLogs();
 fetchSecurityStats();
@@ -1069,7 +1089,8 @@ pollInterval = setInterval(function () {
       <button onclick="closeBlockedModal()" style="background:transparent; border:none; color:var(--muted); font-size:1.4rem; cursor:pointer;">&times;</button>
     </div>
     <div style="padding:1rem 1.5rem; overflow-y:auto; flex:1;" id="blocked-table-container"></div>
-    <div style="padding:1rem 1.5rem; border-top:1px solid var(--border); display:flex; justify-content:flex-end;">
+    <div style="padding:1rem 1.5rem; border-top:1px solid var(--border); display:flex; justify-content:space-between; align-items:center;">
+      <button onclick="unblockAllDevices()" class="btn-sm" style="background:#16a34a; border-color:#22c55e; color:#fff; cursor:pointer;">🔓 Unblock All Devices</button>
       <button onclick="closeBlockedModal()" class="btn-sm">Close</button>
     </div>
   </div>
